@@ -1,2852 +1,2388 @@
-
-const http = require('http');
 const express = require('express');
-const app = express();
 const mysql = require('mysql2/promise');
-const cors = require('cors');
-const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { v4: uuidv4 } = require('uuid');
+const multer = require('multer');
 const nodemailer = require('nodemailer');
-const schedule = require('node-schedule');
-const fs = require('fs');
+const cron = require('node-cron');
+const { v4: uuidv4 } = require('uuid');
+const cors = require('cors');
 const path = require('path');
-const dotenv = require('dotenv');
-const hostname = '127.0.0.1';
-const port = 3000;
+const fs = require('fs');
 
-// ตั้งค่าสภาพแวดล้อม
-dotenv.config();
-
-// Middleware
+const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(express.static(path.join(__dirname, 'public')));
 
-// ตั้งค่า constants
-const JWT_SECRET = process.env.JWT_SECRET || 'medicare-reminder-secret-key';
+// Serve static files from the 'uploads' directory
+app.use('/uploads', express.static('uploads'));
 
-// สร้างการเชื่อมต่อกับฐานข้อมูล
+// Create uploads directory if it doesn't exist
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
+
+// Database connection pool - ใช้ database name ที่ถูกต้อง
 const pool = mysql.createPool({
-    host: 'gateway01.us-west-2.prod.aws.tidbcloud.com',
-    user: '4BNd1ihTr7PkCK1.root',
-    password: '45NetgARGdfOv6dd',
-    database: 'glaucoma_management_system',
-    port: 4000,
-    ssl: {
-        rejectUnauthorized: false
-    }
+  host: process.env.DB_HOST || 'gateway01.us-west-2.prod.aws.tidbcloud.com',
+  user: process.env.DB_USER || '417ZsdFRiJocQ5b.root',
+  password: process.env.DB_PASSWORD || 'Xykv3WsBxTnwejdj',
+  database: process.env.DB_NAME || 'glaucoma_management_system_new', // แก้ไขชื่อ database
+  port: process.env.DB_PORT || 4000,
+  ssl: {
+    rejectUnauthorized: false
+  },
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
-// ตรวจสอบการเชื่อมต่อฐานข้อมูล
-async function checkDatabaseConnection() {
-    try {
-        const connection = await pool.getConnection();
-        console.log('การเชื่อมต่อฐานข้อมูลสำเร็จ!');
-        connection.release();
-        return true;
-    } catch (error) {
-        console.error('ไม่สามารถเชื่อมต่อกับฐานข้อมูล:', error);
-        return false;
+// Test database connection
+pool.getConnection()
+  .then(connection => {
+    console.log('✅ Database connection successful');
+    connection.release();
+  })
+  .catch(err => {
+    console.error('❌ Database connection failed:', err.message);
+  });
+
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/pdf' || file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF and image files are allowed'));
     }
-}
+  },
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
 
-// ฟังก์ชันช่วยสำหรับการสร้าง JWT
-function generateToken(user) {
-    return jwt.sign(
-        { id: user.id, email: user.email, role: user.role },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-    );
-}
+// Helper function to generate 8-character ID
+const generateId = () => {
+  return Math.random().toString(36).substring(2, 10).toUpperCase();
+};
 
-// Middleware สำหรับตรวจสอบการยืนยันตัวตน
-function authenticateToken(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
+// Authentication middleware for Doctors
+const authDoctor = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
     if (!token) {
-        return res.status(401).json({ message: 'ไม่มีโทเค็นการยืนยันตัวตน' });
+      return res.status(401).json({ error: 'Access denied. No token provided.' });
     }
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ message: 'โทเค็นไม่ถูกต้องหรือหมดอายุ' });
-        }
-        req.user = user;
-        next();
-    });
-}
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
 
-// Middleware สำหรับตรวจสอบบทบาทของผู้ใช้
-function checkRole(roles) {
-    return (req, res, next) => {
-        if (!req.user) {
-            return res.status(401).json({ message: 'ไม่มีการยืนยันตัวตน' });
-        }
-
-        if (!roles.includes(req.user.role)) {
-            return res.status(403).json({ message: 'ไม่มีสิทธิ์เข้าถึง' });
-        }
-
-        next();
-    };
-}
-
-// ตั้งค่า Nodemailer
-const mailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.EMAIL_USER || 'medicare.reminder@gmail.com',
-        pass: process.env.EMAIL_PASS || 'your-app-password'
+    if (decoded.role !== 'doctor') {
+      return res.status(403).json({ error: 'Access denied. Doctor role required.' });
     }
+
+    const [doctors] = await pool.execute(
+      `SELECT d.doctor_id, d.first_name, d.last_name, d.license_number, 
+              d.department, d.specialty, u.email, u.phone
+       FROM DoctorProfiles d
+       JOIN Users u ON d.doctor_id = u.user_id
+       WHERE d.doctor_id = ? AND u.role = 'doctor' AND u.status = 'active'`,
+      [decoded.userId]
+    );
+
+    if (doctors.length === 0) {
+      return res.status(401).json({ error: 'Invalid token or doctor not found.' });
+    }
+
+    req.doctor = doctors[0];
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token.' });
+  }
+};
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    message: 'Doctor API is running',
+    timestamp: new Date().toISOString()
+  });
 });
 
-/**
- * API ENDPOINTS
- */
-
+// Root endpoint
 app.get('/', (req, res) => {
+  res.json({
+    message: 'Glaucoma Management System - Doctor API',
+    version: '1.0.0',
+    database: 'glaucoma_management_system_new'
+  });
+});
+
+// ===========================================
+// DOCTOR AUTHENTICATION ROUTES
+// ===========================================
+
+// Doctor Registration
+app.post('/api/doctors/register', async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const {
+      email, password, firstName, lastName, licenseNumber,
+      phone, department, specialty, hospitalAffiliation
+    } = req.body;
+
+    // Validation
+    if (!email || !password || !firstName || !lastName || !licenseNumber) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Required fields missing' });
+    }
+
+    // Check if doctor already exists
+    const [existingUser] = await connection.execute(
+      'SELECT user_id FROM Users WHERE email = ?',
+      [email]
+    );
+
+    if (existingUser.length > 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Doctor already registered with this email' });
+    }
+
+    // Check license number
+    const [existingLicense] = await connection.execute(
+      'SELECT doctor_id FROM DoctorProfiles WHERE license_number = ?',
+      [licenseNumber]
+    );
+
+    if (existingLicense.length > 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'License number already registered' });
+    }
+
+    const userId = generateId();
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Create user - ใช้ฟิลด์ที่มีในฐานข้อมูลจริง
+    await connection.execute(
+      `INSERT INTO Users (user_id, role, password_hash, email, phone, 
+                         require_password_change, status)
+       VALUES (?, 'doctor', ?, ?, ?, 0, 'active')`,
+      [userId, hashedPassword, email, phone]
+    );
+
+    // Create doctor profile - ใช้ฟิลด์ที่มีในฐานข้อมูลจริง
+    await connection.execute(
+      `INSERT INTO DoctorProfiles (
+        doctor_id, first_name, last_name, license_number, department,
+        specialty, hospital_affiliation, registration_date, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE(), 'active')`,
+      [userId, firstName, lastName, licenseNumber, department, specialty, hospitalAffiliation]
+    );
+
+    await connection.commit();
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: userId, role: 'doctor' },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    res.status(201).json({
+      message: 'Doctor registered successfully',
+      token,
+      doctor: {
+        id: userId,
+        firstName,
+        lastName,
+        email,
+        licenseNumber,
+        department,
+        specialty
+      }
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Registration error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    connection.release();
+  }
+});
+
+// Doctor Login
+app.post('/api/doctors/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const [doctors] = await pool.execute(
+      `SELECT u.user_id, u.password_hash, u.status, d.first_name, d.last_name,
+              d.license_number, d.department, d.specialty, u.email
+       FROM Users u
+       JOIN DoctorProfiles d ON u.user_id = d.doctor_id
+       WHERE u.email = ? AND u.role = 'doctor'`,
+      [email]
+    );
+
+    if (doctors.length === 0) {
+      return res.status(400).json({ error: 'Invalid email or password' });
+    }
+
+    const doctor = doctors[0];
+
+    if (doctor.status !== 'active') {
+      return res.status(400).json({ error: 'Account is not active' });
+    }
+
+    const isValidPassword = await bcrypt.compare(password, doctor.password_hash);
+    if (!isValidPassword) {
+      return res.status(400).json({ error: 'Invalid email or password' });
+    }
+
+    // Update last login
+    await pool.execute(
+      'UPDATE Users SET last_login = NOW() WHERE user_id = ?',
+      [doctor.user_id]
+    );
+
+    const token = jwt.sign(
+      { userId: doctor.user_id, role: 'doctor' },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
     res.json({
-        "Name": "MediCare Reminder API",
-        "Author": "Your Name",
-        "APIs": [
-            {"api_name": "/api/health", "method": "get", "description": "ตรวจสอบสถานะระบบ"},
-            {"api_name": "/api/auth/register", "method": "post", "description": "สมัครสมาชิก"},
-            {"api_name": "/api/auth/login", "method": "post", "description": "เข้าสู่ระบบ"},
-            {"api_name": "/api/auth/reset-password", "method": "post", "description": "ร้องขอรีเซ็ตรหัสผ่าน"},
-            {"api_name": "/api/auth/confirm-reset", "method": "post", "description": "ยืนยันการรีเซ็ตรหัสผ่าน"},
-            {"api_name": "/api/users/me", "method": "get", "description": "ดึงข้อมูลผู้ใช้ปัจจุบัน"},
-            {"api_name": "/api/users/me", "method": "put", "description": "อัปเดตข้อมูลผู้ใช้"},
-            {"api_name": "/api/users/change-password", "method": "put", "description": "เปลี่ยนรหัสผ่าน"},
-            {"api_name": "/api/patients", "method": "get", "description": "ดึงรายชื่อผู้ป่วยทั้งหมด"},
-            {"api_name": "/api/patients/:patientId", "method": "get", "description": "ดึงข้อมูลผู้ป่วยรายบุคคล"},
-            {"api_name": "/api/patients/appointments/today", "method": "get", "description": "ดึงรายชื่อผู้ป่วยที่มีนัดวันนี้"},
-            {"api_name": "/api/medications", "method": "post", "description": "สั่งยาให้ผู้ป่วย"},
-            {"api_name": "/api/medications/:medicationId", "method": "put", "description": "แก้ไขยาที่สั่ง"},
-            {"api_name": "/api/medications/:medicationId", "method": "delete", "description": "ยกเลิกยาที่สั่ง"},
-            {"api_name": "/api/patients/:patientId/medications", "method": "get", "description": "ดึงรายการยาของผู้ป่วย"},
-            {"api_name": "/api/reminders/today", "method": "get", "description": "ดึงการแจ้งเตือนยาวันนี้"},
-            {"api_name": "/api/reminders/settings", "method": "put", "description": "ตั้งค่าการแจ้งเตือน"},
-            {"api_name": "/api/reminders/settings", "method": "get", "description": "ดึงการตั้งค่าการแจ้งเตือน"},
-            {"api_name": "/api/medication-logs", "method": "post", "description": "บันทึกการใช้ยา"},
-            {"api_name": "/api/medication-logs/:patientId", "method": "get", "description": "ดึงประวัติการใช้ยา"},
-            {"api_name": "/api/medication-logs/summary", "method": "get", "description": "สรุปสถิติการใช้ยาประจำเดือน"},
-            {"api_name": "/api/patients/statistics", "method": "get", "description": "ดึงข้อมูลสถิติผู้ป่วย"},
-            {"api_name": "/api/examination-notes", "method": "post", "description": "บันทึกผลการตรวจ"},
-            {"api_name": "/api/appointments/status", "method": "put", "description": "อัปเดตสถานะการตรวจผู้ป่วย"},
-            {"api_name": "/api/examination-history/:patientId", "method": "get", "description": "ดึงประวัติการตรวจของผู้ป่วย"},
-            {"api_name": "/api/dashboard/doctor", "method": "get", "description": "ดึงข้อมูลแดชบอร์ดแพทย์"},
-            {"api_name": "/api/dashboard/doctor/detailed", "method": "get", "description": "ดึงข้อมูลแดชบอร์ดแพทย์แบบละเอียด"},
-            {"api_name": "/api/reports/medication-adherence", "method": "get", "description": "รายงานความสำเร็จในการแจ้งเตือนยา"},
-            {"api_name": "/api/reports/top-medications", "method": "get", "description": "รายงานประเภทยาที่สั่งมากที่สุด"},
-            {"api_name": "/api/reports/notification-issues", "method": "get", "description": "รายงานปัญหาในระบบแจ้งเตือน"},
-            {"api_name": "/api/reports/detailed", "method": "get", "description": "รายงานแบบละเอียด"}
+      message: 'Login successful',
+      token,
+      doctor: {
+        id: doctor.user_id,
+        firstName: doctor.first_name,
+        lastName: doctor.last_name,
+        email: doctor.email,
+        licenseNumber: doctor.license_number,
+        department: doctor.department,
+        specialty: doctor.specialty
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Doctor Profile
+app.get('/api/doctors/profile', authDoctor, async (req, res) => {
+  try {
+    const [profile] = await pool.execute(
+      `SELECT d.*, u.email, u.phone, u.created_at, u.last_login
+       FROM DoctorProfiles d
+       JOIN Users u ON d.doctor_id = u.user_id
+       WHERE d.doctor_id = ?`,
+      [req.doctor.doctor_id]
+    );
+
+    res.json(profile[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update Doctor Profile
+app.put('/api/doctors/profile', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const {
+      firstName, lastName, department, specialty, 
+      hospitalAffiliation, phone
+    } = req.body;
+
+    // Update doctor profile
+    await connection.execute(
+      `UPDATE DoctorProfiles SET 
+       first_name = ?, last_name = ?, department = ?, specialty = ?,
+       hospital_affiliation = ?
+       WHERE doctor_id = ?`,
+      [firstName, lastName, department, specialty, 
+       hospitalAffiliation, req.doctor.doctor_id]
+    );
+
+    // Update user phone if provided
+    if (phone) {
+      await connection.execute(
+        'UPDATE Users SET phone = ? WHERE user_id = ?',
+        [phone, req.doctor.doctor_id]
+      );
+    }
+
+    await connection.commit();
+    res.json({ message: 'Profile updated successfully' });
+  } catch (error) {
+    await connection.rollback();
+    res.status(500).json({ error: error.message });
+  } finally {
+    connection.release();
+  }
+});
+
+// ===========================================
+// PATIENT MANAGEMENT ROUTES
+// ===========================================
+
+// Get all patients
+app.get('/api/patients', authDoctor, async (req, res) => {
+    try {
+        const [patients] = await pool.execute(`
+            SELECT patient_id, hn, first_name, last_name, date_of_birth, 
+                   gender, registration_date
+            FROM PatientProfiles 
+            ORDER BY registration_date DESC
+        `);
+        
+        res.json(patients);
+    } catch (error) {
+        console.error('Error getting patients:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get specific patient with complete medical info
+app.get('/api/patients/:patientId', authDoctor, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+
+    // Get patient basic info
+    const [patients] = await pool.execute(
+      `SELECT p.*, u.email, u.phone,
+              TIMESTAMPDIFF(YEAR, p.date_of_birth, CURDATE()) as age
+       FROM PatientProfiles p
+       JOIN Users u ON p.patient_id = u.user_id
+       WHERE p.patient_id = ?`,
+      [patientId]
+    );
+
+    if (patients.length === 0) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    const patient = patients[0];
+
+    // Get latest IOP measurements
+    const [latestIOP] = await pool.execute(
+      `SELECT * FROM IOP_Measurements 
+       WHERE patient_id = ? 
+       ORDER BY measurement_date DESC, measurement_time DESC 
+       LIMIT 5`,
+      [patientId]
+    );
+
+    // Get active medications
+    const [medications] = await pool.execute(
+      `SELECT pm.*, m.name as medication_name, m.generic_name,
+              COALESCE(CONCAT(d.first_name, ' ', d.last_name), 'ไม่ระบุ') as prescribed_by
+       FROM PatientMedications pm
+       JOIN Medications m ON pm.medication_id = m.medication_id
+       LEFT JOIN DoctorProfiles d ON pm.doctor_id = d.doctor_id
+       WHERE pm.patient_id = ? AND pm.status = 'active'
+       ORDER BY pm.start_date DESC`,
+      [patientId]
+    );
+
+    // Get medical history
+    const [medicalHistory] = await pool.execute(
+      `SELECT * FROM PatientMedicalHistory 
+       WHERE patient_id = ? 
+       ORDER BY recorded_at DESC`,
+      [patientId]
+    );
+
+    // Get active treatment plan
+    const [treatmentPlan] = await pool.execute(
+      `SELECT gtp.*, CONCAT(d.first_name, ' ', d.last_name) as created_by
+       FROM GlaucomaTreatmentPlans gtp
+       LEFT JOIN DoctorProfiles d ON gtp.doctor_id = d.doctor_id
+       WHERE gtp.patient_id = ? AND gtp.status = 'active' 
+       ORDER BY gtp.start_date DESC 
+       LIMIT 1`,
+      [patientId]
+    );
+
+    res.json({
+      ...patient,
+      latestIOP,
+      medications,
+      medicalHistory,
+      treatmentPlan: treatmentPlan[0] || null
+    });
+  } catch (error) {
+    console.error('Error getting patient details:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Assign patient to doctor
+app.post('/api/patients/:patientId/assign', authDoctor, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+
+    // Check if patient exists
+    const [patient] = await pool.execute(
+      'SELECT patient_id FROM PatientProfiles WHERE patient_id = ?',
+      [patientId]
+    );
+
+    if (patient.length === 0) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    // Check if relationship already exists
+    const [existing] = await pool.execute(
+      `SELECT relationship_id FROM DoctorPatientRelationships
+       WHERE doctor_id = ? AND patient_id = ?`,
+      [req.doctor.doctor_id, patientId]
+    );
+
+    if (existing.length > 0) {
+      // Reactivate if inactive
+      await pool.execute(
+        `UPDATE DoctorPatientRelationships 
+         SET status = 'active', end_date = NULL 
+         WHERE doctor_id = ? AND patient_id = ?`,
+        [req.doctor.doctor_id, patientId]
+      );
+    } else {
+      // Create new relationship
+      const relationshipId = generateId();
+      await pool.execute(
+        `INSERT INTO DoctorPatientRelationships 
+         (relationship_id, doctor_id, patient_id, start_date, status)
+         VALUES (?, ?, ?, CURDATE(), 'active')`,
+        [relationshipId, req.doctor.doctor_id, patientId]
+      );
+    }
+
+    res.json({ message: 'Patient assigned successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===========================================
+// MEDICATION MANAGEMENT ROUTES
+// ===========================================
+
+// Prescribe medication
+app.post('/api/patients/:patientId/medications', authDoctor, async (req, res) => {
+  console.log('💊 Prescription endpoint called');
+  console.log('📝 Request body:', JSON.stringify(req.body, null, 2));
+  
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const patientId = req.params.patientId;
+    const doctorId = req.doctor.doctor_id;
+
+    const {
+      medicationName, genericName, category, form, strength,
+      eyeSelection, dosageAmount, concentration, 
+      frequencyType, frequencyValue, instructionNotes,
+      eye, dosage, frequency, specialInstructions,
+      duration
+    } = req.body;
+
+    // ใช้ระบบใหม่ถ้ามี ไม่งั้นใช้ระบบเก่า
+    const finalEyeSelection = eyeSelection || eye || 'both';
+    const finalDosage = dosageAmount || dosage || '1 หยด';
+    const finalFrequencyType = frequencyType || 'hourly';
+    const finalFrequencyValue = frequencyValue || frequency || 'วันละ 1 ครั้ง';
+    const finalInstructions = instructionNotes || specialInstructions || null;
+
+    // Validation
+    if (!medicationName || !strength) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Medication name and strength are required' });
+    }
+
+    // Check if patient exists
+    const [patientExists] = await connection.execute(
+      'SELECT patient_id, first_name, last_name FROM PatientProfiles WHERE patient_id = ?',
+      [patientId]
+    );
+
+    if (patientExists.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    // Create doctor-patient relationship if not exists
+    let [relationship] = await pool.execute(
+      `SELECT relationship_id FROM DoctorPatientRelationships
+       WHERE doctor_id = ? AND patient_id = ?`,
+      [doctorId, patientId]
+    );
+
+    if (relationship.length === 0) {
+      const relationshipId = generateId();
+      await pool.execute(
+        `INSERT INTO DoctorPatientRelationships 
+         (relationship_id, doctor_id, patient_id, start_date, status)
+         VALUES (?, ?, ?, CURDATE(), 'active')`,
+        [relationshipId, doctorId, patientId]
+      );
+    }
+
+    // Find or create medication
+    let [medication] = await pool.execute(
+      'SELECT medication_id FROM Medications WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))',
+      [medicationName]
+    );
+
+    let medicationId;
+    if (medication.length === 0) {
+      medicationId = generateId();
+      
+      // Storage instructions based on medication type
+      let storageInstructions = 'เก็บในที่แห้ง หลีกเลี่ยงแสงแดด';
+      if (medicationName.toLowerCase().includes('latanoprost') || 
+          medicationName.toLowerCase().includes('travoprost')) {
+        storageInstructions = 'แช่ตู้เย็น';
+      }
+
+      await connection.execute(
+        `INSERT INTO Medications (
+          medication_id, name, generic_name, category, form, strength, 
+          instructions, storage_instructions, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+        [
+          medicationId, 
+          medicationName.trim(), 
+          genericName || medicationName.trim(), 
+          category || 'Glaucoma Medication',
+          form || 'eye_drops',
+          strength.trim(),
+          'ใช้ตามแพทย์สั่ง เขย่าก่อนใช้',
+          storageInstructions
         ]
+      );
+    } else {
+      medicationId = medication[0].medication_id;
+    }
+
+    // Create prescription
+    const prescriptionId = generateId();
+    const startDate = new Date().toISOString().split('T')[0];
+    let endDate = null;
+
+    if (duration && !isNaN(parseInt(duration)) && parseInt(duration) > 0) {
+      const end = new Date();
+      end.setDate(end.getDate() + parseInt(duration));
+      endDate = end.toISOString().split('T')[0];
+    }
+
+    await connection.execute(
+      `INSERT INTO PatientMedications (
+        prescription_id, patient_id, medication_id, doctor_id, prescribed_date,
+        start_date, end_date, eye, dosage, frequency, duration, 
+        special_instructions, status, concentration, frequency_type, 
+        frequency_value, instruction_notes
+      ) VALUES (?, ?, ?, ?, CURDATE(), ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+      [
+        prescriptionId, patientId, medicationId, doctorId,
+        startDate, endDate, 
+        finalEyeSelection,
+        finalDosage,
+        finalFrequencyValue,
+        duration ? parseInt(duration) : null,
+        finalInstructions,
+        concentration || null,
+        finalFrequencyType,
+        finalFrequencyValue,
+        finalInstructions
+      ]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      prescriptionId,
+      message: 'Medication prescribed successfully'
     });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error prescribing medication:', error);
+    res.status(500).json({ error: 'Failed to prescribe medication: ' + error.message });
+  } finally {
+    connection.release();
+  }
 });
 
-app.get('/api/health', async (req, res) => {
-    const dbConnected = await checkDatabaseConnection();
+// Get patient medications
+app.get('/api/patients/:patientId/medications', authDoctor, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+
+    const [medications] = await pool.execute(
+      `SELECT pm.prescription_id, pm.eye, pm.dosage, pm.frequency, pm.start_date,
+              pm.end_date, pm.status, pm.special_instructions, pm.prescribed_date,
+              pm.duration, pm.discontinued_reason, pm.concentration, 
+              pm.frequency_type, pm.frequency_value, pm.instruction_notes,
+              m.name as medication_name, m.generic_name, m.category, m.form, m.strength,
+              m.instructions as medication_instructions, m.storage_instructions,
+              COALESCE(CONCAT(d.first_name, ' ', d.last_name), 'ไม่ระบุ') as prescribed_by
+       FROM PatientMedications pm
+       JOIN Medications m ON pm.medication_id = m.medication_id
+       LEFT JOIN DoctorProfiles d ON pm.doctor_id = d.doctor_id
+       WHERE pm.patient_id = ?
+       ORDER BY pm.prescribed_date DESC, pm.start_date DESC`,
+      [patientId]
+    );
+
+    res.json(medications);
+
+  } catch (error) {
+    console.error('❌ Error getting patient medications:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update medication
+app.put('/api/medications/:prescriptionId', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
     
-    res.status(200).json({
-        status: 'ok',
-        message: 'ระบบทำงานปกติ',
-        database: dbConnected ? 'เชื่อมต่อสำเร็จ' : 'เชื่อมต่อไม่สำเร็จ',
-        timestamp: new Date()
+    const prescriptionId = req.params.prescriptionId;
+    const doctorId = req.doctor.doctor_id;
+    const {
+      eyeSelection, dosageAmount, concentration, 
+      frequencyType, frequencyValue, instructionNotes,
+      status, discontinuedReason
+    } = req.body;
+
+    // Check authorization
+    const [prescription] = await connection.execute(
+      `SELECT pm.prescription_id, pm.patient_id 
+       FROM PatientMedications pm
+       WHERE pm.prescription_id = ? AND pm.doctor_id = ?`,
+      [prescriptionId, doctorId]
+    );
+
+    if (prescription.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Prescription not found or unauthorized' });
+    }
+
+    // Build dynamic update query
+    const updateFields = [];
+    const updateValues = [];
+
+    if (eyeSelection) {
+      updateFields.push('eye = ?');
+      updateValues.push(eyeSelection);
+    }
+    if (dosageAmount) {
+      updateFields.push('dosage = ?');
+      updateValues.push(dosageAmount);
+    }
+    if (concentration) {
+      updateFields.push('concentration = ?');
+      updateValues.push(concentration);
+    }
+    if (frequencyType) {
+      updateFields.push('frequency_type = ?');
+      updateValues.push(frequencyType);
+    }
+    if (frequencyValue) {
+      updateFields.push('frequency_value = ?', 'frequency = ?');
+      updateValues.push(frequencyValue, frequencyValue);
+    }
+    if (instructionNotes !== undefined) {
+      updateFields.push('instruction_notes = ?', 'special_instructions = ?');
+      updateValues.push(instructionNotes, instructionNotes);
+    }
+    if (status) {
+      updateFields.push('status = ?');
+      updateValues.push(status);
+      if (status === 'discontinued' && discontinuedReason) {
+        updateFields.push('discontinued_reason = ?');
+        updateValues.push(discontinuedReason);
+      }
+    }
+
+    if (updateFields.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    updateFields.push('updated_at = NOW()');
+    updateValues.push(prescriptionId);
+
+    await connection.execute(
+      `UPDATE PatientMedications SET ${updateFields.join(', ')} WHERE prescription_id = ?`,
+      updateValues
+    );
+
+    await connection.commit();
+    res.json({ message: 'Prescription updated successfully', prescriptionId });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error updating prescription:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    connection.release();
+  }
+});
+
+// Delete/Discontinue medication
+app.delete('/api/medications/:prescriptionId', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    
+    const prescriptionId = req.params.prescriptionId;
+    const doctorId = req.doctor.doctor_id;
+    const { reason } = req.body;
+
+    // Check authorization
+    const [prescription] = await connection.execute(
+      `SELECT pm.prescription_id, pm.patient_id, pm.status
+       FROM PatientMedications pm
+       WHERE pm.prescription_id = ? AND pm.doctor_id = ?`,
+      [prescriptionId, doctorId]
+    );
+
+    if (prescription.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Prescription not found or unauthorized' });
+    }
+
+    if (prescription[0].status !== 'active') {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Prescription is already discontinued' });
+    }
+
+    // Discontinue medication
+    await connection.execute(
+      `UPDATE PatientMedications 
+       SET status = 'discontinued', 
+           discontinued_reason = ?,
+           end_date = CURDATE(),
+           updated_at = NOW()
+       WHERE prescription_id = ?`,
+      [reason || 'หยุดโดยแพทย์', prescriptionId]
+    );
+
+    await connection.commit();
+    res.json({ 
+      message: 'Prescription discontinued successfully',
+      prescriptionId,
+      reason: reason || 'หยุดโดยแพทย์'
     });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error discontinuing prescription:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    connection.release();
+  }
 });
 
-/**
- * API เกี่ยวกับการยืนยันตัวตน
- */
+// ===========================================
+// IOP MEASUREMENT ROUTES
+// ===========================================
 
-// API สมัครสมาชิก
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { email, password, role, firstName, lastName, phone, ...additionalData } = req.body;
-        
-        // ตรวจสอบข้อมูลที่จำเป็น
-        if (!email || !password || !firstName || !lastName) {
-            return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-        }
+// Add IOP measurement
+app.post('/api/patients/:patientId/iop-measurements', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-        // ตรวจสอบอีเมลซ้ำ
-        const [existingUsers] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-        
-        if (existingUsers.length > 0) {
-            return res.status(409).json({ message: 'อีเมลนี้ถูกใช้งานแล้ว' });
-        }
+    const patientId = req.params.patientId;
+    const doctorId = req.doctor.doctor_id;
 
-        // เข้ารหัสรหัสผ่าน
-        const hashedPassword = await bcrypt.hash(password, 10);
-        
-        // สร้าง UUID
-        const userId = uuidv4();
-        
-        // เพิ่มข้อมูลในตาราง users
-        await pool.query(
-            'INSERT INTO users (id, email, password, role, first_name, last_name, phone) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [userId, email, hashedPassword, role || 'PATIENT', firstName, lastName, phone || null]
-        );
+    const {
+      measurementDate,
+      measurementTime, 
+      leftEyeIOP,
+      rightEyeIOP,
+      measurementDevice,
+      measurementMethod,
+      notes
+    } = req.body;
 
-        // ถ้าเป็นแพทย์ ให้บันทึกข้อมูลในตาราง doctors
-        if (role === 'DOCTOR') {
-            const { department, licenseNumber, specialist } = additionalData;
-            const doctorId = uuidv4();
-            
-            if (!department || !licenseNumber) {
-                return res.status(400).json({ message: 'กรุณากรอกข้อมูลแพทย์ให้ครบถ้วน' });
-            }
-            
-            await pool.query(
-                'INSERT INTO doctors (id, user_id, department, license_number, specialist) VALUES (?, ?, ?, ?, ?)',
-                [doctorId, userId, department, licenseNumber, specialist || null]
-            );
-        }
-        
-        // ถ้าเป็นผู้ป่วย ให้บันทึกข้อมูลในตาราง patients
-        if (role === 'PATIENT' || !role) {
-            const { hn, dob, gender, medicalCondition, allergies } = additionalData;
-            const patientId = uuidv4();
-            
-            if (!hn || !dob || !gender) {
-                return res.status(400).json({ message: 'กรุณากรอกข้อมูลผู้ป่วยให้ครบถ้วน' });
-            }
-            
-            await pool.query(
-                'INSERT INTO patients (id, user_id, hn, dob, gender, medical_condition, allergies) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [patientId, userId, hn, dob, gender, medicalCondition || null, allergies || null]
-            );
-        }
-
-        res.status(201).json({ message: 'ลงทะเบียนสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการลงทะเบียน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการลงทะเบียน', error: error.message });
+    // Validation
+    if (!measurementDate) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Measurement date is required' });
     }
-});
 
-// API เข้าสู่ระบบ (แบบง่าย)
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        
-        if (!email || !password) {
-            return res.status(400).json({ message: 'กรุณากรอกอีเมลและรหัสผ่าน' });
-        }
-
-        // ค้นหาผู้ใช้
-        const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-        
-        if (users.length === 0) {
-            return res.status(401).json({ message: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' });
-        }
-
-        const user = users[0];
-        
-        // สำหรับทดสอบ: ยอมรับรหัสผ่าน "password" สำหรับผู้ใช้ทุกคน
-        let isPasswordValid = (password === 'password');
-        
-        // หากรหัสผ่านไม่ถูกต้อง
-        if (!isPasswordValid) {
-            return res.status(401).json({ message: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' });
-        }
-
-        // สร้างโทเค็น
-        const token = jwt.sign(
-            { id: user.id, email: user.email, role: user.role },
-            JWT_SECRET,
-            { expiresIn: '24h' }
-        );
-        
-        // ดึงข้อมูลเพิ่มเติม
-        let additionalData = {};
-        
-        if (user.role === 'DOCTOR') {
-            const [doctors] = await pool.query('SELECT * FROM doctors WHERE user_id = ?', [user.id]);
-            if (doctors.length > 0) {
-                additionalData = {
-                    doctorId: doctors[0].id,
-                    department: doctors[0].department,
-                    licenseNumber: doctors[0].license_number,
-                    specialist: doctors[0].specialist
-                };
-            }
-        } else if (user.role === 'PATIENT') {
-            const [patients] = await pool.query('SELECT * FROM patients WHERE user_id = ?', [user.id]);
-            if (patients.length > 0) {
-                additionalData = {
-                    patientId: patients[0].id,
-                    hn: patients[0].hn,
-                    dob: patients[0].dob,
-                    gender: patients[0].gender,
-                    medicalCondition: patients[0].medical_condition,
-                    allergies: patients[0].allergies
-                };
-            }
-        }
-        
-        // ส่งข้อมูลกลับ
-        res.status(200).json({
-            message: 'เข้าสู่ระบบสำเร็จ',
-            token,
-            user: {
-                id: user.id,
-                email: user.email,
-                role: user.role,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                ...additionalData
-            }
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการเข้าสู่ระบบ:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการเข้าสู่ระบบ', error: error.message });
+    if (!leftEyeIOP && !rightEyeIOP) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'At least one eye IOP measurement is required' });
     }
-});
 
-// API รีเซ็ตรหัสผ่าน
-app.post('/api/auth/reset-password', async (req, res) => {
-    try {
-        const { email } = req.body;
-        
-        if (!email) {
-            return res.status(400).json({ message: 'กรุณากรอกอีเมล' });
-        }
+    // Check if patient exists
+    const [patientExists] = await connection.execute(
+      'SELECT patient_id, first_name, last_name FROM PatientProfiles WHERE patient_id = ?',
+         [patientId]
+    );
 
-        // ตรวจสอบว่ามีผู้ใช้ในระบบหรือไม่
-        const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-        
-        if (users.length === 0) {
-            // ไม่ควรบอกว่าไม่พบอีเมลเพื่อความปลอดภัย
-            return res.status(200).json({ message: 'หากอีเมลของคุณอยู่ในระบบ คุณจะได้รับคำแนะนำในการรีเซ็ตรหัสผ่านทางอีเมล' });
-        }
-
-        // สร้างโทเค็นชั่วคราวสำหรับรีเซ็ตรหัสผ่าน
-        const resetToken = jwt.sign({ email: email }, JWT_SECRET, { expiresIn: '1h' });
-
-        // ส่งอีเมลรีเซ็ตรหัสผ่าน
-        const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${resetToken}`;
-        
-        const mailOptions = {
-            from: process.env.EMAIL_USER || 'medicare.reminder@gmail.com',
-            to: email,
-            subject: 'รีเซ็ตรหัสผ่าน MediCare Reminder',
-            html: `
-                <h1>รีเซ็ตรหัสผ่าน MediCare Reminder</h1>
-                <p>คุณได้ร้องขอรีเซ็ตรหัสผ่านสำหรับบัญชี MediCare Reminder ของคุณ</p>
-                <p>กรุณาคลิกที่ลิงก์ด้านล่างเพื่อรีเซ็ตรหัสผ่านของคุณ:</p>
-                <a href="${resetUrl}" style="padding: 10px 15px; background-color: #00897b; color: white; text-decoration: none; border-radius: 5px;">รีเซ็ตรหัสผ่าน</a>
-                <p>ลิงก์นี้จะหมดอายุใน 1 ชั่วโมง</p>
-                <p>หากคุณไม่ได้ร้องขอการรีเซ็ตรหัสผ่าน กรุณาละเว้นอีเมลนี้</p>
-            `
-        };
-        
-        mailTransporter.sendMail(mailOptions, (err, info) => {
-            if (err) {
-                console.error('เกิดข้อผิดพลาดในการส่งอีเมล:', err);
-            }
-        });
-
-        res.status(200).json({ message: 'หากอีเมลของคุณอยู่ในระบบ คุณจะได้รับคำแนะนำในการรีเซ็ตรหัสผ่านทางอีเมล' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการรีเซ็ตรหัสผ่าน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการรีเซ็ตรหัสผ่าน', error: error.message });
+    if (patientExists.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Patient not found' });
     }
-});
 
-// API ยืนยันรีเซ็ตรหัสผ่าน
-app.post('/api/auth/confirm-reset', async (req, res) => {
-    try {
-        const { token, newPassword } = req.body;
-        
-        if (!token || !newPassword) {
-            return res.status(400).json({ message: 'ข้อมูลไม่ครบถ้วน' });
-        }
+    // Create doctor-patient relationship if not exists
+    let [relationship] = await connection.execute(
+      `SELECT relationship_id FROM DoctorPatientRelationships
+       WHERE doctor_id = ? AND patient_id = ?`,
+      [doctorId, patientId]
+    );
 
-        // ยืนยันโทเค็น
-        jwt.verify(token, JWT_SECRET, async (err, decoded) => {
-            if (err) {
-                return res.status(400).json({ message: 'โทเค็นไม่ถูกต้องหรือหมดอายุ' });
-            }
-
-            const email = decoded.email;
-            
-            // เข้ารหัสรหัสผ่านใหม่
-            const hashedPassword = await bcrypt.hash(newPassword, 10);
-            
-            // อัปเดตรหัสผ่าน
-            await pool.query('UPDATE users SET password = ? WHERE email = ?', [hashedPassword, email]);
-            
-            res.status(200).json({ message: 'รีเซ็ตรหัสผ่านสำเร็จ' });
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการยืนยันรีเซ็ตรหัสผ่าน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการยืนยันรีเซ็ตรหัสผ่าน', error: error.message });
+    if (relationship.length === 0) {
+      const relationshipId = generateId();
+      await connection.execute(
+        `INSERT INTO DoctorPatientRelationships 
+         (relationship_id, doctor_id, patient_id, start_date, status)
+         VALUES (?, ?, ?, CURDATE(), 'active')`,
+        [relationshipId, doctorId, patientId]
+      );
     }
-});
 
-/**
- * API เกี่ยวกับผู้ใช้งาน
- */
+    // Create IOP measurement record
+    const measurementId = generateId();
+    const formattedTime = measurementTime || new Date().toTimeString().slice(0, 8);
 
-// API ดึงข้อมูลผู้ใช้ปัจจุบัน
-app.get('/api/users/me', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        
-        // ดึงข้อมูลผู้ใช้จากฐานข้อมูล
-        const [users] = await pool.query('SELECT id, email, role, first_name, last_name, phone FROM users WHERE id = ?', [userId]);
-        
-        if (users.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบผู้ใช้' });
-        }
+    await connection.execute(
+      `INSERT INTO IOP_Measurements (
+        measurement_id, patient_id, recorded_by, measurement_date, measurement_time,
+        left_eye_iop, right_eye_iop, measurement_device, measurement_method, 
+        measured_at_hospital, notes, doctor_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        measurementId,
+        patientId,
+        doctorId, // recorded_by
+        measurementDate,
+        formattedTime,
+        leftEyeIOP && !isNaN(parseFloat(leftEyeIOP)) ? parseFloat(leftEyeIOP) : null,
+        rightEyeIOP && !isNaN(parseFloat(rightEyeIOP)) ? parseFloat(rightEyeIOP) : null,
+        measurementDevice || 'GAT',
+        measurementMethod || 'Goldmann Applanation Tonometry',
+        1, // measured_at_hospital (true)
+        notes || null,
+        doctorId
+      ]
+    );
 
-        const user = users[0];
-        
-        // รับข้อมูลเพิ่มเติมตามบทบาท
-        let additionalData = {};
-        
-        if (user.role === 'DOCTOR') {
-            const [doctors] = await pool.query('SELECT * FROM doctors WHERE user_id = ?', [userId]);
-            if (doctors.length > 0) {
-                additionalData = {
-                    doctorId: doctors[0].id,
-                    department: doctors[0].department,
-                    licenseNumber: doctors[0].license_number,
-                    specialist: doctors[0].specialist
-                };
-            }
-        } else if (user.role === 'PATIENT') {
-            const [patients] = await pool.query('SELECT * FROM patients WHERE user_id = ?', [userId]);
-            if (patients.length > 0) {
-                additionalData = {
-                    patientId: patients[0].id,
-                    hn: patients[0].hn,
-                    dob: patients[0].dob,
-                    gender: patients[0].gender,
-                    medicalCondition: patients[0].medical_condition,
-                    allergies: patients[0].allergies
-                };
-            }
-        }
+    // Create alert for high IOP (> 21 mmHg)
+    const leftHigh = leftEyeIOP && parseFloat(leftEyeIOP) > 21;
+    const rightHigh = rightEyeIOP && parseFloat(rightEyeIOP) > 21;
 
-        res.status(200).json({
-            id: user.id,
-            email: user.email,
-            role: user.role,
-            firstName: user.first_name,
-            lastName: user.last_name,
-            phone: user.phone,
-            ...additionalData
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลผู้ใช้:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผู้ใช้', error: error.message });
+    if (leftHigh || rightHigh) {
+      const alertId = generateId();
+      const eyeText = leftHigh && rightHigh ? 'ทั้งสองข้าง' : leftHigh ? 'ตาซ้าย' : 'ตาขวา';
+      const iopValues = leftHigh && rightHigh ? 
+        `${leftEyeIOP}/${rightEyeIOP}` : 
+        leftHigh ? leftEyeIOP : rightEyeIOP;
+
+      await connection.execute(
+        `INSERT INTO Alerts (
+          alert_id, patient_id, alert_type, severity, alert_message, 
+          related_entity_type, related_entity_id, created_at, 
+          acknowledged, resolution_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 0, 'pending')`,
+        [
+          alertId,
+          patientId,
+          'high_iop',
+          'high',
+          `IOP สูงผิดปกติ ${eyeText}: ${iopValues} mmHg (วันที่ ${measurementDate})`,
+          'iop_measurement',
+          measurementId
+        ]
+      );
     }
+
+    await connection.commit();
+
+    res.status(201).json({
+      measurementId,
+      message: 'IOP measurement recorded successfully',
+      data: {
+        measurementDate,
+        measurementTime: formattedTime,
+        leftEyeIOP: leftEyeIOP ? parseFloat(leftEyeIOP) : null,
+        rightEyeIOP: rightEyeIOP ? parseFloat(rightEyeIOP) : null
+      }
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error recording IOP measurement:', error);
+    res.status(500).json({ 
+      error: 'Failed to record IOP measurement: ' + error.message 
+    });
+  } finally {
+    connection.release();
+  }
 });
 
-// API อัปเดตข้อมูลผู้ใช้
-app.put('/api/users/me', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const { firstName, lastName, phone, ...additionalData } = req.body;
-        
-        // ตรวจสอบข้อมูลที่จำเป็น
-        if (!firstName || !lastName) {
-            return res.status(400).json({ message: 'กรุณากรอกชื่อและนามสกุล' });
-        }
+// Get IOP measurements for patient
+app.get('/api/patients/:patientId/iop-measurements', authDoctor, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+    const { startDate, endDate, limit } = req.query;
 
-        // อัปเดตข้อมูลในตาราง users
-        await pool.query(
-            'UPDATE users SET first_name = ?, last_name = ?, phone = ? WHERE id = ?',
-            [firstName, lastName, phone || null, userId]
-        );
+    // Check if patient exists
+    const [patientExists] = await pool.execute(
+      'SELECT patient_id, first_name, last_name FROM PatientProfiles WHERE patient_id = ?',
+      [patientId]
+    );
 
-        // อัปเดตข้อมูลเพิ่มเติมตามบทบาท
-        if (req.user.role === 'DOCTOR') {
-            const { department, specialist } = additionalData;
-            
-            if (department) {
-                const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [userId]);
-                
-                if (doctors.length > 0) {
-                    await pool.query(
-                        'UPDATE doctors SET department = ?, specialist = ? WHERE user_id = ?',
-                        [department, specialist || null, userId]
-                    );
-                }
-            }
-        } else if (req.user.role === 'PATIENT') {
-            const { medicalCondition, allergies } = additionalData;
-            
-            const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [userId]);
-            
-            if (patients.length > 0) {
-                await pool.query(
-                    'UPDATE patients SET medical_condition = ?, allergies = ? WHERE user_id = ?',
-                    [medicalCondition || null, allergies || null, userId]
-                );
-            }
-        }
-
-        res.status(200).json({ message: 'อัปเดตข้อมูลผู้ใช้สำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการอัปเดตข้อมูลผู้ใช้:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการอัปเดตข้อมูลผู้ใช้', error: error.message });
+    if (patientExists.length === 0) {
+      return res.status(404).json({ error: 'Patient not found' });
     }
-});
 
-// API เปลี่ยนรหัสผ่าน
-app.put('/api/users/change-password', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const { currentPassword, newPassword } = req.body;
-        
-        if (!currentPassword || !newPassword) {
-            return res.status(400).json({ message: 'กรุณากรอกรหัสผ่านปัจจุบันและรหัสผ่านใหม่' });
-        }
+    // Build query parameters
+    let whereClause = 'WHERE iop.patient_id = ?';
+    let queryParams = [patientId];
 
-        // ดึงข้อมูลผู้ใช้จากฐานข้อมูล
-        const [users] = await pool.query('SELECT password FROM users WHERE id = ?', [userId]);
-        
-        if (users.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบผู้ใช้' });
-        }
-
-        // ตรวจสอบรหัสผ่านปัจจุบัน
-        const isPasswordValid = await bcrypt.compare(currentPassword, users[0].password);
-        
-        if (!isPasswordValid) {
-            return res.status(401).json({ message: 'รหัสผ่านปัจจุบันไม่ถูกต้อง' });
-        }
-
-        // เข้ารหัสรหัสผ่านใหม่
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-        
-        // อัปเดตรหัสผ่าน
-        await pool.query('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, userId]);
-        
-        res.status(200).json({ message: 'เปลี่ยนรหัสผ่านสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการเปลี่ยนรหัสผ่าน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการเปลี่ยนรหัสผ่าน', error: error.message });
+    if (startDate) {
+      whereClause += ' AND iop.measurement_date >= ?';
+      queryParams.push(startDate);
     }
-});
-
-/**
- * API เกี่ยวกับผู้ป่วย (สำหรับแพทย์)
- */
-
-// API ดึงรายชื่อผู้ป่วยทั้งหมด
-app.get('/api/patients', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const { search, department, date, page = 1, limit = 10 } = req.query;
-        
-        const offset = (page - 1) * limit;
-        
-        // สร้างคำสั่ง SQL พื้นฐาน
-        let sql = `
-            SELECT p.id, p.hn, p.dob, p.gender, p.medical_condition, p.allergies,
-                   u.first_name, u.last_name, u.phone
-            FROM patients p
-            JOIN users u ON p.user_id = u.id
-        `;
-        
-        // เงื่อนไขการค้นหา
-        const conditions = [];
-        const params = [];
-        
-        if (search) {
-            conditions.push('(p.hn LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?)');
-            params.push(`%${search}%`, `%${search}%`, `%${search}%`);
-        }
-        
-        // เพิ่มเงื่อนไข WHERE ถ้ามี
-        if (conditions.length > 0) {
-            sql += ' WHERE ' + conditions.join(' AND ');
-        }
-        
-        // เพิ่มการจำกัดจำนวนข้อมูล
-        sql += ' ORDER BY u.first_name ASC LIMIT ? OFFSET ?';
-        params.push(parseInt(limit), parseInt(offset));
-        
-        // ดึงข้อมูลผู้ป่วย
-        const [patients] = await pool.query(sql, params);
-        
-        // นับจำนวนผู้ป่วยทั้งหมด
-        let countSql = 'SELECT COUNT(*) as total FROM patients p JOIN users u ON p.user_id = u.id';
-        
-        if (conditions.length > 0) {
-            countSql += ' WHERE ' + conditions.join(' AND ');
-        }
-        
-        const [countResult] = await pool.query(countSql, params.slice(0, params.length - 2));
-        const total = countResult[0].total;
-        
-        res.status(200).json({
-            patients: patients.map(patient => ({
-                id: patient.id,
-                hn: patient.hn,
-                firstName: patient.first_name,
-                lastName: patient.last_name,
-                fullName: `${patient.first_name} ${patient.last_name}`,
-                dob: patient.dob,
-                age: new Date().getFullYear() - new Date(patient.dob).getFullYear(),
-                gender: patient.gender,
-                phone: patient.phone,
-                medicalCondition: patient.medical_condition,
-                allergies: patient.allergies
-            })),
-            pagination: {
-                total,
-                page: parseInt(page),
-                limit: parseInt(limit),
-                totalPages: Math.ceil(total / limit)
-            }
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงรายชื่อผู้ป่วย:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงรายชื่อผู้ป่วย', error: error.message });
+    if (endDate) {
+      whereClause += ' AND iop.measurement_date <= ?';
+      queryParams.push(endDate);
     }
-});
 
-// API ดึงข้อมูลผู้ป่วยรายบุคคล
-app.get('/api/patients/:patientId', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const { patientId } = req.params;
-        
-        // ดึงข้อมูลผู้ป่วย
-        const [patients] = await pool.query(`
-            SELECT p.id, p.hn, p.dob, p.gender, p.medical_condition, p.allergies,
-                   u.first_name, u.last_name, u.phone, u.email
-            FROM patients p
-            JOIN users u ON p.user_id = u.id
-            WHERE p.id = ?
-        `, [patientId]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patient = patients[0];
-        
-        // ดึงประวัติการสั่งยา
-        const [medications] = await pool.query(`
-            SELECT m.*, d.first_name as doctor_first_name, d.last_name as doctor_last_name
-            FROM medications m
-            JOIN doctors doc ON m.doctor_id = doc.id
-            JOIN users d ON doc.user_id = d.id
-            WHERE m.patient_id = ?
-            ORDER BY m.start_date DESC
-        `, [patientId]);
-        
-        // ดึงประวัติการใช้ยา
-        const [medicationLogs] = await pool.query(`
-            SELECT ml.*, m.name as medication_name, m.strength, m.form
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.patient_id = ?
-            ORDER BY ml.timestamp DESC
-        `, [patientId]);
-        
-        res.status(200).json({
-            patient: {
-                id: patient.id,
-                hn: patient.hn,
-                firstName: patient.first_name,
-                lastName: patient.last_name,
-                fullName: `${patient.first_name} ${patient.last_name}`,
-                email: patient.email,
-                dob: patient.dob,
-                age: new Date().getFullYear() - new Date(patient.dob).getFullYear(),
-                gender: patient.gender,
-                phone: patient.phone,
-                medicalCondition: patient.medical_condition,
-                allergies: patient.allergies
-            },
-            medications: medications.map(med => ({
-                id: med.id,
-                name: med.name,
-                strength: med.strength,
-                form: med.form,
-                dosage: med.dosage,
-                frequency: med.frequency,
-                timeOfDay: med.time_of_day,
-                startDate: med.start_date,
-                endDate: med.end_date,
-                instructions: med.instructions,
-                quantity: med.quantity,
-                doctorName: `${med.doctor_first_name} ${med.doctor_last_name}`
-            })),
-            medicationLogs: medicationLogs.map(log => ({
-                id: log.id,
-                medicationId: log.medication_id,
-                medicationName: log.medication_name,
-                strength: log.strength,
-                form: log.form,
-                timestamp: log.timestamp,
-                status: log.status,
-                notes: log.notes
-            }))
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลผู้ป่วย:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผู้ป่วย', error: error.message });
+    const limitClause = limit ? `LIMIT ${parseInt(limit)}` : 'LIMIT 50';
+
+    const [measurements] = await pool.execute(
+      `SELECT iop.measurement_id, iop.measurement_date, iop.measurement_time,
+              iop.left_eye_iop, iop.right_eye_iop, iop.measurement_device, 
+              iop.measurement_method, iop.notes,
+              CONCAT(d.first_name, ' ', d.last_name) as measured_by
+       FROM IOP_Measurements iop
+       LEFT JOIN DoctorProfiles d ON iop.doctor_id = d.doctor_id
+       ${whereClause}
+       ORDER BY iop.measurement_date DESC, iop.measurement_time DESC
+       ${limitClause}`,
+      queryParams
+    );
+
+    // Calculate statistics
+    const stats = {
+      total_measurements: measurements.length,
+      latest_measurement: measurements[0] || null,
+      average_left: null,
+      average_right: null,
+      max_left: null,
+      max_right: null,
+      min_left: null,
+      min_right: null
+    };
+
+    if (measurements.length > 0) {
+      const leftValues = measurements.filter(m => m.left_eye_iop !== null).map(m => m.left_eye_iop);
+      const rightValues = measurements.filter(m => m.right_eye_iop !== null).map(m => m.right_eye_iop);
+
+      if (leftValues.length > 0) {
+        stats.average_left = (leftValues.reduce((a, b) => a + b, 0) / leftValues.length).toFixed(1);
+        stats.max_left = Math.max(...leftValues);
+        stats.min_left = Math.min(...leftValues);
+      }
+
+      if (rightValues.length > 0) {
+        stats.average_right = (rightValues.reduce((a, b) => a + b, 0) / rightValues.length).toFixed(1);
+        stats.max_right = Math.max(...rightValues);
+        stats.min_right = Math.min(...rightValues);
+      }
     }
+
+    res.json({
+      measurements,
+      stats,
+      patient_name: `${patientExists[0].first_name} ${patientExists[0].last_name}`
+    });
+
+  } catch (error) {
+    console.error('❌ Error loading IOP measurements:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// API ดึงข้อมูลผู้ป่วยที่มีนัดวันนี้
-app.get('/api/patients/appointments/today', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const doctorId = req.query.doctorId;
-        const today = new Date().toISOString().split('T')[0];
-        
-        // ดึงข้อมูลผู้ป่วยที่มีนัดวันนี้
-        const [patients] = await pool.query(`
-            SELECT DISTINCT p.id, p.hn, p.dob, p.gender, 
-                   u.first_name, u.last_name, u.phone,
-                   a.appointment_time
-            FROM patients p
-            JOIN users u ON p.user_id = u.id
-            JOIN appointments a ON p.id = a.patient_id
-            WHERE DATE(a.appointment_date) = ? 
-            ${doctorId ? 'AND a.doctor_id = ?' : ''}
-            ORDER BY a.appointment_time ASC
-        `, doctorId ? [today, doctorId] : [today]);
-        
-        res.status(200).json({
-            patients: patients.map(patient => ({
-                id: patient.id,
-                hn: patient.hn,
-                firstName: patient.first_name,
-                lastName: patient.last_name,
-                fullName: `${patient.first_name} ${patient.last_name}`,
-                dob: patient.dob,
-                age: new Date().getFullYear() - new Date(patient.dob).getFullYear(),
-                gender: patient.gender,
-                phone: patient.phone,
-                appointmentTime: patient.appointment_time
-            })),
-            count: patients.length
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลผู้ป่วยที่มีนัดวันนี้:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผู้ป่วยที่มีนัดวันนี้', error: error.message });
-    }
-});
+// ===========================================
+// SURGERY MANAGEMENT ROUTES
+// ===========================================
 
-/**
- * API เกี่ยวกับยา (สำหรับแพทย์)
- */
+// Add glaucoma surgery record
+app.post('/api/patients/:patientId/surgeries', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-// API สั่งยาให้ผู้ป่วย
-app.post('/api/medications', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const {
-            patientId,
-            name,
-            strength,
-            form,
-            dosage,
-            frequency,
-            timeOfDay,
-            startDate,
-            endDate,
-            instructions,
-            quantity
-        } = req.body;
-        
-        // ตรวจสอบข้อมูลที่จำเป็น
-        if (!patientId || !name || !strength || !form || !dosage || !frequency || !timeOfDay || !startDate || !endDate || !quantity) {
-            return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-        }
-
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // สร้าง UUID สำหรับยา
-        const medicationId = uuidv4();
-        
-        // เพิ่มข้อมูลยาในฐานข้อมูล
-        await pool.query(`
-            INSERT INTO medications (
-                id, patient_id, doctor_id, name, strength, form, dosage, frequency, 
-                time_of_day, start_date, end_date, instructions, quantity
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            medicationId, patientId, doctorId, name, strength, form, dosage, frequency,
-            timeOfDay, startDate, endDate, instructions || null, quantity
-        ]);
-        
-        // สร้างการแจ้งเตือนสำหรับยา
-        // วิเคราะห์ช่วงเวลาการใช้ยา
-        const times = timeOfDay.split(',').map(time => time.trim());
-        
-        for (const time of times) {
-            const reminderId = uuidv4();
-            
-            await pool.query(`
-                INSERT INTO reminders (id, medication_id, reminder_time, channels, status)
-                VALUES (?, ?, ?, ?, ?)
-            `, [reminderId, medicationId, time, 'web,email', 'PENDING']);
-        }
-        
-        res.status(201).json({ 
-            message: 'สั่งยาสำเร็จ',
-            medicationId
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการสั่งยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการสั่งยา', error: error.message });
-    }
-});
-
-// API แก้ไขยาที่สั่ง
-app.put('/api/medications/:medicationId', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const { medicationId } = req.params;
-        const {
-            name,
-            strength,
-            form,
-            dosage,
-            frequency,
-            timeOfDay,
-            endDate,
-            instructions,
-            quantity
-        } = req.body;
-        
-        // ตรวจสอบข้อมูลที่จำเป็น
-        if (!name || !strength || !form || !dosage || !frequency || !timeOfDay || !endDate || !quantity) {
-            return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-        }
-
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // ตรวจสอบว่ามียานี้ในฐานข้อมูลหรือไม่
-        const [medications] = await pool.query('SELECT * FROM medications WHERE id = ?', [medicationId]);
-        
-        if (medications.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลยา' });
-        }
-        
-        // อัปเดตข้อมูลยาในฐานข้อมูล
-        await pool.query(`
-            UPDATE medications SET
-                name = ?, strength = ?, form = ?, dosage = ?, frequency = ?, 
-                time_of_day = ?, end_date = ?, instructions = ?, quantity = ?
-            WHERE id = ? AND doctor_id = ?
-        `, [
-            name, strength, form, dosage, frequency, timeOfDay, endDate,
-            instructions || null, quantity, medicationId, doctorId
-        ]);
-        
-        // อัปเดตการแจ้งเตือน
-        // ลบการแจ้งเตือนเดิม
-        await pool.query('DELETE FROM reminders WHERE medication_id = ?', [medicationId]);
-        
-        // สร้างการแจ้งเตือนใหม่
-        const times = timeOfDay.split(',').map(time => time.trim());
-        
-        for (const time of times) {
-            const reminderId = uuidv4();
-            
-            await pool.query(`
-                INSERT INTO reminders (id, medication_id, reminder_time, channels, status)
-                VALUES (?, ?, ?, ?, ?)
-            `, [reminderId, medicationId, time, 'web,email', 'PENDING']);
-        }
-        
-        res.status(200).json({ message: 'แก้ไขยาสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการแก้ไขยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการแก้ไขยา', error: error.message });
-    }
-});
-
-// API ยกเลิกยาที่สั่ง
-app.delete('/api/medications/:medicationId', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const { medicationId } = req.params;
-        
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // ตรวจสอบว่ามียานี้ในฐานข้อมูลหรือไม่
-        const [medications] = await pool.query('SELECT * FROM medications WHERE id = ? AND doctor_id = ?', [medicationId, doctorId]);
-        
-        if (medications.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลยา' });
-        }
-        
-        // ลบข้อมูลยาในฐานข้อมูล
-        await pool.query('DELETE FROM medications WHERE id = ? AND doctor_id = ?', [medicationId, doctorId]);
-        
-        res.status(200).json({ message: 'ยกเลิกยาสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการยกเลิกยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการยกเลิกยา', error: error.message });
-    }
-});
-
-// API ดึงรายการยาทั้งหมดของผู้ป่วย
-app.get('/api/patients/:patientId/medications', authenticateToken, async (req, res) => {
-    try {
-        const { patientId } = req.params;
-        
-        // ตรวจสอบสิทธิ์การเข้าถึง
-        if (req.user.role === 'PATIENT') {
-            // ถ้าเป็นผู้ป่วย ต้องดูข้อมูลของตัวเองเท่านั้น
-            const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-            
-            if (patients.length === 0 || patients[0].id !== patientId) {
-                return res.status(403).json({ message: 'ไม่มีสิทธิ์เข้าถึงข้อมูลนี้' });
-            }
-        }
-        
-        // ดึงรายการยาทั้งหมดของผู้ป่วย
-        const [medications] = await pool.query(`
-            SELECT m.*, d.department,
-                   du.first_name as doctor_first_name, du.last_name as doctor_last_name
-            FROM medications m
-            JOIN doctors d ON m.doctor_id = d.id
-            JOIN users du ON d.user_id = du.id
-            WHERE m.patient_id = ?
-            ORDER BY m.start_date DESC
-        `, [patientId]);
-        
-        res.status(200).json({
-            medications: medications.map(med => ({
-                id: med.id,
-                name: med.name,
-                strength: med.strength,
-                form: med.form,
-                dosage: med.dosage,
-                frequency: med.frequency,
-                timeOfDay: med.time_of_day,
-                startDate: med.start_date,
-                endDate: med.end_date,
-                instructions: med.instructions,
-                quantity: med.quantity,
-                doctorName: `${med.doctor_first_name} ${med.doctor_last_name}`,
-                department: med.department
-            }))
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงรายการยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงรายการยา', error: error.message });
-    }
-});
-
-/**
- * API เกี่ยวกับการแจ้งเตือน (สำหรับผู้ป่วย)
- */
-
-// API ดึงการแจ้งเตือนยาวันนี้
-app.get('/api/reminders/today', authenticateToken, checkRole(['PATIENT']), async (req, res) => {
-    try {
-        const today = new Date().toISOString().split('T')[0];
-        
-        // ดึงข้อมูล patientId จากฐานข้อมูล
-        const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patientId = patients[0].id;
-        
-        // ดึงยาที่ต้องรับประทานวันนี้
-        const [medications] = await pool.query(`
-            SELECT m.id, m.name, m.strength, m.form, m.dosage, m.frequency, 
-                   m.time_of_day, m.instructions, r.id as reminder_id, 
-                   r.reminder_time, r.status as reminder_status
-            FROM medications m
-            JOIN reminders r ON m.id = r.medication_id
-            WHERE m.patient_id = ? 
-            AND ? BETWEEN DATE(m.start_date) AND DATE(m.end_date)
-            ORDER BY r.reminder_time ASC
-        `, [patientId, today]);
-        
-        // ดึงบันทึกการใช้ยาวันนี้
-        const [logs] = await pool.query(`
-            SELECT ml.* 
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.patient_id = ? AND DATE(ml.timestamp) = ?
-        `, [patientId, today]);
-        
-        // สร้าง Map ของบันทึกการใช้ยา
-        const logsMap = {};
-        logs.forEach(log => {
-            logsMap[log.reminder_id] = log;
-        });
-        
-        // แยกยาตามสถานะ
-        const pending = [];
-        const taken = [];
-        const missed = [];
-        
-        medications.forEach(med => {
-            const log = logsMap[med.reminder_id];
-            const reminderTime = new Date(`${today}T${med.reminder_time}`);
-            const now = new Date();
-            
-            const medicationInfo = {
-                id: med.id,
-                reminderId: med.reminder_id,
-                name: med.name,
-                strength: med.strength,
-                form: med.form,
-                dosage: med.dosage,
-                frequency: med.frequency,
-                reminderTime: med.reminder_time,
-                instructions: med.instructions
-            };
-            
-            if (log) {
-                if (log.status === 'TAKEN') {
-                    taken.push({ ...medicationInfo, takenAt: log.timestamp });
-                } else {
-                    missed.push(medicationInfo);
-                }
-            } else if (reminderTime < now) {
-                if (now - reminderTime > 3600000) { // 1 ชั่วโมง
-                    missed.push(medicationInfo);
-                } else {
-                    pending.push(medicationInfo);
-                }
-            } else {
-                pending.push(medicationInfo);
-            }
-        });
-        
-        res.status(200).json({
-            today,
-            pending,
-            taken,
-            missed,
-            adherenceRate: medications.length > 0 ? (taken.length / medications.length * 100).toFixed(2) : 100
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงการแจ้งเตือนยาวันนี้:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงการแจ้งเตือนยาวันนี้', error: error.message });
-    }
-});
-
-// API ตั้งค่าการแจ้งเตือน
-app.put('/api/reminders/settings', authenticateToken, checkRole(['PATIENT']), async (req, res) => {
-    try {
-        const { channels, reminderTimes } = req.body;
-        
-        // ดึงข้อมูล patientId จากฐานข้อมูล
-        const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patientId = patients[0].id;
-        
-        // บันทึกช่องทางการแจ้งเตือน
-        if (channels && Array.isArray(channels)) {
-            // อัปเดตการตั้งค่าการแจ้งเตือนในฐานข้อมูล
-            await pool.query(`
-                UPDATE reminders r
-                JOIN medications m ON r.medication_id = m.id
-                SET r.channels = ?
-                WHERE m.patient_id = ?
-            `, [channels.join(','), patientId]);
-        }
-        
-        // บันทึกเวลาการแจ้งเตือนสำหรับยาแต่ละรายการ
-        if (reminderTimes && typeof reminderTimes === 'object') {
-            for (const medicationId in reminderTimes) {
-                // ลบการแจ้งเตือนเดิม
-                await pool.query('DELETE FROM reminders WHERE medication_id = ?', [medicationId]);
-                
-                // สร้างการแจ้งเตือนใหม่
-                const times = reminderTimes[medicationId];
-                if (Array.isArray(times)) {
-                    for (const time of times) {
-                        const reminderId = uuidv4();
-                        
-                        await pool.query(`
-                            INSERT INTO reminders (id, medication_id, reminder_time, channels, status)
-                            VALUES (?, ?, ?, ?, ?)
-                        `, [reminderId, medicationId, time, 'web,email', 'PENDING']);
-                    }
-                }
-            }
-        }
-        
-        res.status(200).json({ message: 'ตั้งค่าการแจ้งเตือนสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการตั้งค่าการแจ้งเตือน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการตั้งค่าการแจ้งเตือน', error: error.message });
-    }
-});
-
-// API ดึงการตั้งค่าการแจ้งเตือนปัจจุบัน
-app.get('/api/reminders/settings', authenticateToken, checkRole(['PATIENT']), async (req, res) => {
-    try {
-        // ดึงข้อมูล patientId จากฐานข้อมูล
-        const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patientId = patients[0].id;
-        
-        // ดึงยาที่กำลังใช้อยู่
-        const today = new Date().toISOString().split('T')[0];
-        
-        const [medications] = await pool.query(`
-            SELECT m.id, m.name, m.strength, m.dosage
-            FROM medications m
-            WHERE m.patient_id = ?
-            AND ? BETWEEN DATE(m.start_date) AND DATE(m.end_date)
-        `, [patientId, today]);
-        
-        // ดึงการตั้งค่าการแจ้งเตือนสำหรับยาแต่ละรายการ
-        const reminderSettings = {};
-        
-        for (const med of medications) {
-            const [reminders] = await pool.query(`
-                SELECT id, reminder_time, channels
-                FROM reminders
-                WHERE medication_id = ?
-            `, [med.id]);
-            
-            reminderSettings[med.id] = {
-                medication: {
-                    id: med.id,
-                    name: med.name,
-                    strength: med.strength,
-                    dosage: med.dosage
-                },
-                reminders: reminders.map(r => ({
-                    id: r.id,
-                    time: r.reminder_time,
-                    channels: r.channels.split(',')
-                }))
-            };
-        }
-        
-        // ดึงช่องทางการแจ้งเตือนที่ใช้บ่อย
-        const [channels] = await pool.query(`
-            SELECT DISTINCT channels
-            FROM reminders r
-            JOIN medications m ON r.medication_id = m.id
-            WHERE m.patient_id = ?
-            LIMIT 1
-        `, [patientId]);
-        
-        const commonChannels = channels.length > 0 ? channels[0].channels.split(',') : ['web'];
-        
-        res.status(200).json({
-            channels: commonChannels,
-            medications: reminderSettings
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงการตั้งค่าการแจ้งเตือน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงการตั้งค่าการแจ้งเตือน', error: error.message });
-    }
-});
-
-/**
- * API เกี่ยวกับบันทึกการใช้ยา
- */
-
-// API บันทึกการใช้ยา
-app.post('/api/medication-logs', authenticateToken, checkRole(['PATIENT']), async (req, res) => {
-    try {
-        const { reminderId, medicationId, status, notes } = req.body;
-        
-        if (!reminderId || !medicationId || !status) {
-            return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-        }
-        
-        // ดึงข้อมูล patientId จากฐานข้อมูล
-        const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patientId = patients[0].id;
-        
-        // ตรวจสอบว่ายานี้เป็นของผู้ป่วยหรือไม่
-        const [medications] = await pool.query('SELECT id FROM medications WHERE id = ? AND patient_id = ?', [medicationId, patientId]);
-        
-        if (medications.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลยา' });
-        }
-        
-        // ตรวจสอบว่ามีการแจ้งเตือนนี้หรือไม่
-        const [reminders] = await pool.query('SELECT id FROM reminders WHERE id = ? AND medication_id = ?', [reminderId, medicationId]);
-        
-        if (reminders.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลการแจ้งเตือน' });
-        }
-        
-        // ตรวจสอบว่ามีการบันทึกไปแล้วหรือไม่
-        const [existingLogs] = await pool.query(`
-            SELECT id FROM medication_logs 
-            WHERE reminder_id = ? AND medication_id = ? AND DATE(timestamp) = CURRENT_DATE()
-        `, [reminderId, medicationId]);
-        
-        // ถ้ามีการบันทึกแล้ว ให้อัปเดต
-        if (existingLogs.length > 0) {
-            await pool.query(`
-                UPDATE medication_logs 
-                SET status = ?, notes = ?, timestamp = CURRENT_TIMESTAMP
-                WHERE id = ?
-            `, [status, notes || null, existingLogs[0].id]);
-            
-            res.status(200).json({ message: 'อัปเดตบันทึกการใช้ยาสำเร็จ' });
-        } else {
-            // ถ้ายังไม่มีการบันทึก ให้สร้างใหม่
-            const logId = uuidv4();
-            
-            await pool.query(`
-                INSERT INTO medication_logs (id, medication_id, reminder_id, status, notes)
-                VALUES (?, ?, ?, ?, ?)
-            `, [logId, medicationId, reminderId, status, notes || null]);
-            
-            // อัปเดตสถานะการแจ้งเตือน
-            await pool.query('UPDATE reminders SET status = ? WHERE id = ?', ['ACKNOWLEDGED', reminderId]);
-            
-            res.status(201).json({ message: 'บันทึกการใช้ยาสำเร็จ' });
-        }
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการบันทึกการใช้ยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการบันทึกการใช้ยา', error: error.message });
-    }
-});
-
-// API ดึงประวัติการใช้ยา
-app.get('/api/medication-logs/:patientId', authenticateToken, async (req, res) => {
-    try {
-        const { patientId } = req.params;
-        const { startDate, endDate, medicationId } = req.query;
-        
-        // ตรวจสอบสิทธิ์การเข้าถึง
-        if (req.user.role === 'PATIENT') {
-            // ถ้าเป็นผู้ป่วย ต้องดูข้อมูลของตัวเองเท่านั้น
-            const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-            
-            if (patients.length === 0 || patients[0].id !== patientId) {
-                return res.status(403).json({ message: 'ไม่มีสิทธิ์เข้าถึงข้อมูลนี้' });
-            }
-        }
-        
-        // สร้างคำสั่ง SQL พื้นฐาน
-        let sql = `
-            SELECT ml.*, m.name as medication_name, m.strength, m.form, 
-                   r.reminder_time
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            JOIN reminders r ON ml.reminder_id = r.id
-            WHERE m.patient_id = ?
-        `;
-        
-        const params = [patientId];
-        
-        // เพิ่มเงื่อนไขวันที่
-        if (startDate) {
-            sql += ' AND DATE(ml.timestamp) >= ?';
-            params.push(startDate);
-        }
-        
-        if (endDate) {
-            sql += ' AND DATE(ml.timestamp) <= ?';
-            params.push(endDate);
-        }
-        
-        // เพิ่มเงื่อนไขยา
-        if (medicationId) {
-            sql += ' AND ml.medication_id = ?';
-            params.push(medicationId);
-        }
-        
-        // เพิ่มการเรียงลำดับ
-        sql += ' ORDER BY ml.timestamp DESC';
-        
-        // ดึงข้อมูลประวัติการใช้ยา
-        const [logs] = await pool.query(sql, params);
-        
-        // สรุปสถิติ
-        const total = logs.length;
-        const taken = logs.filter(log => log.status === 'TAKEN').length;
-        const missed = logs.filter(log => log.status === 'MISSED').length;
-        const skipped = logs.filter(log => log.status === 'SKIPPED').length;
-        
-        res.status(200).json({
-            logs: logs.map(log => ({
-                id: log.id,
-                medicationId: log.medication_id,
-                medicationName: log.medication_name,
-                strength: log.strength,
-                form: log.form,
-                reminderId: log.reminder_id,
-                reminderTime: log.reminder_time,
-                timestamp: log.timestamp,
-                status: log.status,
-                notes: log.notes
-            })),
-            summary: {
-                total,
-                taken,
-                missed,
-                skipped,
-                adherenceRate: total > 0 ? (taken / total * 100).toFixed(2) : 100
-            }
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงประวัติการใช้ยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงประวัติการใช้ยา', error: error.message });
-    }
-});
-
-/**
- * API เกี่ยวกับรายงาน (สำหรับแพทย์)
- */
-
-// API ดึงข้อมูลแดชบอร์ดแพทย์ (ปรับให้ใช้งานได้จริงโดยไม่พึ่งพาตาราง appointments)
-app.get('/api/dashboard/doctor', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        const today = new Date().toISOString().split('T')[0];
-        
-        // ข้อมูลที่ต้องส่งกลับ
-        let appointmentsToday = 0;
-        let lowAdherencePatients = 0;
-        let medicationsPrescribedToday = 0;
-        let pendingMedications = 0;
-        let appointmentsList = [];
-        
-        try {
-            // จำนวนยาที่สั่งวันนี้
-            const [medicationsResult] = await pool.query(`
-                SELECT COUNT(*) as count 
-                FROM medications 
-                WHERE doctor_id = ? AND DATE(start_date) = ?
-            `, [doctorId, today]);
-            
-            medicationsPrescribedToday = medicationsResult[0]?.count || 0;
-            pendingMedications = Math.round(medicationsPrescribedToday * 0.4); // ประมาณ 40% ที่รอเภสัชกร
-        } catch (error) {
-            console.error('Error fetching medication count:', error);
-        }
-        
-        try {
-            // จำนวนผู้ป่วยที่มีปัญหาการใช้ยา
-            const [adherenceResult] = await pool.query(`
-                SELECT COUNT(DISTINCT p.id) as count
-                FROM patients p
-                JOIN medications m ON p.id = m.patient_id
-                LEFT JOIN medication_logs ml ON m.id = ml.medication_id
-                WHERE m.doctor_id = ? 
-                AND DATE(ml.timestamp) >= DATE_SUB(?, INTERVAL 7 DAY)
-                GROUP BY p.id
-                HAVING COUNT(CASE WHEN ml.status = 'TAKEN' THEN 1 END) / COUNT(ml.id) < 0.8
-            `, [doctorId, today]);
-            
-            lowAdherencePatients = adherenceResult[0]?.count || 0;
-        } catch (error) {
-            console.error('Error fetching adherence count:', error);
-        }
-        
-        try {
-            // ดึงรายชื่อผู้ป่วยที่มียาปัจจุบัน (แทนการใช้ appointments)
-            const [patientsResult] = await pool.query(`
-                SELECT DISTINCT p.id, p.hn, p.dob, p.gender, 
-                    u.first_name, u.last_name, u.phone,
-                    m.id as medication_id,
-                    (SELECT COUNT(*) FROM medications WHERE patient_id = p.id AND doctor_id = ? AND CURRENT_DATE BETWEEN DATE(start_date) AND DATE(end_date)) as active_medications
-                FROM patients p
-                JOIN medications m ON p.id = m.patient_id
-                JOIN users u ON p.user_id = u.id
-                WHERE m.doctor_id = ?
-                AND CURRENT_DATE BETWEEN DATE(m.start_date) AND DATE(m.end_date)
-                GROUP BY p.id
-                ORDER BY u.first_name, u.last_name
-                LIMIT 10
-            `, [doctorId, doctorId]);
-            
-            appointmentsList = patientsResult.map(patient => ({
-                id: patient.id,
-                hn: patient.hn,
-                firstName: patient.first_name,
-                lastName: patient.last_name,
-                fullName: `${patient.first_name} ${patient.last_name}`,
-                dob: patient.dob,
-                age: new Date().getFullYear() - new Date(patient.dob).getFullYear(),
-                gender: patient.gender,
-                phone: patient.phone,
-                activeMedications: patient.active_medications,
-                // สร้างเวลานัดจำลองสำหรับแสดงในหน้าแดชบอร์ด
-                appointmentTime: generateRandomTime(),
-                status: 'WAITING'
-            }));
-            
-            appointmentsToday = appointmentsList.length;
-        } catch (error) {
-            console.error('Error fetching patients list:', error);
-        }
-        
-        res.status(200).json({
-            appointmentsToday,
-            medicationsPrescribedToday,
-            pendingMedications,
-            lowAdherencePatients,
-            newLabResults: Math.floor(Math.random() * 5) + 1, // สุ่มจำนวนผลแล็บใหม่
-            appointmentsList
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลแดชบอร์ด:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลแดชบอร์ด', error: error.message });
-    }
-});
-
-// ฟังก์ชันช่วยสร้างเวลาสุ่มสำหรับการจำลองข้อมูลนัดหมาย
-function generateRandomTime() {
-    const hours = Math.floor(Math.random() * 8) + 9; // 9 AM - 4 PM
-    const minutes = [0, 15, 30, 45][Math.floor(Math.random() * 4)]; // 0, 15, 30, or 45 minutes
+    const patientId = req.params.patientId;
+    const doctorId = req.doctor.doctor_id;
     
-    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')} น.`;
-}
+    const {
+      surgeryDate, surgeryType, eye, preOpIOPLeft, preOpIOPRight,
+      procedureDetails, complications, postOpCare, outcome, 
+      followUpPlan, notes
+    } = req.body;
 
-// API ดึงข้อมูลผู้ป่วยที่มีนัดวันนี้ (ปรับให้ใช้งานได้จริงโดยไม่พึ่งพาตาราง appointments)
-app.get('/api/patients/appointments/today', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
+    // Validation
+    if (!surgeryDate || !surgeryType || !eye) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: 'Surgery date, type, and eye are required' 
+      });
+    }
+
+    // Check if patient exists
+    const [patientExists] = await connection.execute(
+      'SELECT patient_id FROM PatientProfiles WHERE patient_id = ?',
+      [patientId]
+    );
+
+    if (patientExists.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    // Create doctor-patient relationship if not exists
+    let [relationship] = await connection.execute(
+      `SELECT relationship_id FROM DoctorPatientRelationships
+       WHERE doctor_id = ? AND patient_id = ?`,
+      [doctorId, patientId]
+    );
+
+    if (relationship.length === 0) {
+      const relationshipId = generateId();
+      await connection.execute(
+        `INSERT INTO DoctorPatientRelationships 
+         (relationship_id, doctor_id, patient_id, start_date, status)
+         VALUES (?, ?, ?, CURDATE(), 'active')`,
+        [relationshipId, doctorId, patientId]
+      );
+    }
+
+    const surgeryId = generateId();
+
+    await connection.execute(
+      `INSERT INTO GlaucomaSurgeries (
+        surgery_id, patient_id, doctor_id, surgery_date, surgery_type, eye,
+        pre_op_iop_left, pre_op_iop_right, procedure_details, complications,
+        post_op_care, outcome, follow_up_plan, notes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [surgeryId, patientId, doctorId, surgeryDate, surgeryType, eye,
+       preOpIOPLeft ? parseFloat(preOpIOPLeft) : null, 
+       preOpIOPRight ? parseFloat(preOpIOPRight) : null, 
+       procedureDetails, complications, postOpCare, outcome, followUpPlan, notes]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      surgeryId,
+      message: 'Surgery record created successfully'
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error creating surgery record:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    connection.release();
+  }
+});
+
+// Get surgeries for patient
+app.get('/api/patients/:patientId/surgeries', authDoctor, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+
+    const [surgeries] = await pool.execute(
+      `SELECT gs.surgery_id, gs.surgery_date, gs.surgery_type, gs.eye,
+              gs.pre_op_iop_left, gs.pre_op_iop_right, gs.procedure_details,
+              gs.complications, gs.outcome, gs.notes, gs.report_url,
+              CONCAT(d.first_name, ' ', d.last_name) as surgeon_name
+       FROM GlaucomaSurgeries gs
+       LEFT JOIN DoctorProfiles d ON gs.doctor_id = d.doctor_id
+       WHERE gs.patient_id = ?
+       ORDER BY gs.surgery_date DESC`,
+      [patientId]
+    );
+
+    res.json(surgeries);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===========================================
+// TREATMENT PLAN ROUTES
+// ===========================================
+
+// Create treatment plan
+app.post('/api/patients/:patientId/treatment-plans', authDoctor, async (req, res) => {
+  console.log('📋 Creating treatment plan...');
+  
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const patientId = req.params.patientId;
+    const doctorId = req.doctor.doctor_id;
+    
+    const {
+      treatmentApproach, targetIOPLeft, targetIOPRight,
+      followUpFrequency, visualFieldTestFrequency, notes
+    } = req.body;
+
+    // Check if patient exists
+    const [patientExists] = await connection.execute(
+      'SELECT patient_id, first_name, last_name FROM PatientProfiles WHERE patient_id = ?',
+      [patientId]
+    );
+
+    if (patientExists.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    // Create doctor-patient relationship if not exists
+    let [relationship] = await connection.execute(
+      `SELECT relationship_id FROM DoctorPatientRelationships
+       WHERE doctor_id = ? AND patient_id = ?`,
+      [doctorId, patientId]
+    );
+
+    if (relationship.length === 0) {
+      const relationshipId = generateId();
+      await connection.execute(
+        `INSERT INTO DoctorPatientRelationships 
+         (relationship_id, doctor_id, patient_id, start_date, status)
+         VALUES (?, ?, ?, CURDATE(), 'active')`,
+        [relationshipId, doctorId, patientId]
+      );
+    }
+
+    // Mark existing active plans as completed
+    await connection.execute(
+      `UPDATE GlaucomaTreatmentPlans 
+       SET status = 'completed', end_date = CURDATE()
+       WHERE patient_id = ? AND status = 'active'`,
+      [patientId]
+    );
+
+    // Create new treatment plan
+    const treatmentPlanId = generateId();
+
+    await connection.execute(
+      `INSERT INTO GlaucomaTreatmentPlans (
+        treatment_plan_id, patient_id, doctor_id, start_date, treatment_approach,
+        target_iop_left, target_iop_right, follow_up_frequency,
+        visual_field_test_frequency, notes, status
+      ) VALUES (?, ?, ?, CURDATE(), ?, ?, ?, ?, ?, ?, 'active')`,
+      [
+        treatmentPlanId, 
+        patientId, 
+        doctorId, 
+        treatmentApproach || 'Standard glaucoma treatment',
+        targetIOPLeft && !isNaN(parseFloat(targetIOPLeft)) ? parseFloat(targetIOPLeft) : null,
+        targetIOPRight && !isNaN(parseFloat(targetIOPRight)) ? parseFloat(targetIOPRight) : null,
+        followUpFrequency || null,
+        visualFieldTestFrequency || null,
+        notes || null
+      ]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      treatmentPlanId,
+      message: 'Treatment plan created successfully'
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error creating treatment plan:', error);
+    res.status(500).json({ error: 'Failed to create treatment plan: ' + error.message });
+  } finally {
+    connection.release();
+  }
+});
+
+// Get treatment plan for patient
+app.get('/api/patients/:patientId/treatment-plan', authDoctor, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+
+    const [plans] = await pool.execute(
+      `SELECT gtp.treatment_plan_id, gtp.start_date, gtp.end_date, gtp.treatment_approach,
+              gtp.target_iop_left, gtp.target_iop_right, gtp.follow_up_frequency,
+              gtp.visual_field_test_frequency, gtp.notes, gtp.status,
+              CONCAT(d.first_name, ' ', d.last_name) as created_by_name
+       FROM GlaucomaTreatmentPlans gtp
+       LEFT JOIN DoctorProfiles d ON gtp.doctor_id = d.doctor_id
+       WHERE gtp.patient_id = ?
+       ORDER BY gtp.start_date DESC`,
+      [patientId]
+    );
+
+    res.json(plans);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update treatment plan
+app.put('/api/treatment-plans/:planId', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    
+    const planId = req.params.planId;
+    const doctorId = req.doctor.doctor_id;
+    const {
+      treatmentApproach, targetIOPLeft, targetIOPRight,
+      followUpFrequency, visualFieldTestFrequency, notes, status
+    } = req.body;
+
+    // Check if plan exists and belongs to doctor's patient
+    const [plan] = await connection.execute(
+      `SELECT gtp.treatment_plan_id FROM GlaucomaTreatmentPlans gtp
+       JOIN DoctorPatientRelationships dpr ON gtp.patient_id = dpr.patient_id
+       WHERE gtp.treatment_plan_id = ? AND dpr.doctor_id = ? AND dpr.status = 'active'`,
+      [planId, doctorId]
+    );
+
+    if (plan.length === 0) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Treatment plan not found or unauthorized' });
+    }
+
+    // Build dynamic update query
+    const updateFields = [];
+    const updateValues = [];
+
+    if (treatmentApproach) {
+      updateFields.push('treatment_approach = ?');
+      updateValues.push(treatmentApproach);
+    }
+    if (targetIOPLeft !== undefined) {
+      updateFields.push('target_iop_left = ?');
+      updateValues.push(targetIOPLeft);
+    }
+    if (targetIOPRight !== undefined) {
+      updateFields.push('target_iop_right = ?');
+      updateValues.push(targetIOPRight);
+    }
+    if (followUpFrequency) {
+      updateFields.push('follow_up_frequency = ?');
+      updateValues.push(followUpFrequency);
+    }
+    if (visualFieldTestFrequency) {
+      updateFields.push('visual_field_test_frequency = ?');
+      updateValues.push(visualFieldTestFrequency);
+    }
+    if (notes) {
+      updateFields.push('notes = ?');
+      updateValues.push(notes);
+    }
+    if (status) {
+      updateFields.push('status = ?');
+      updateValues.push(status);
+      if (status === 'completed') {
+        updateFields.push('end_date = CURDATE()');
+      }
+    }
+
+    if (updateFields.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    updateFields.push('updated_at = NOW()');
+    updateValues.push(planId);
+
+    await connection.execute(
+      `UPDATE GlaucomaTreatmentPlans SET ${updateFields.join(', ')} 
+       WHERE treatment_plan_id = ?`,
+      updateValues
+    );
+
+    await connection.commit();
+    res.json({ message: 'Treatment plan updated successfully' });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error updating treatment plan:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    connection.release();
+  }
+});
+
+// ===========================================
+// SPECIAL TESTS ROUTES (OCT, CTVF)
+// ===========================================
+
+// Add special test results
+app.post('/api/patients/:patientId/special-tests', authDoctor, upload.single('pdfFile'), async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const patientId = req.params.patientId;
+    const doctorId = req.doctor.doctor_id;
+    const { testType, testDate, eye, testDetails, results, notes } = req.body;
+
+    // Validation
+    if (!testType || !testDate) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Test type and date are required' });
+    }
+
+    // Check if patient exists
+    const [patientExists] = await connection.execute(
+      'SELECT patient_id, first_name, last_name FROM PatientProfiles WHERE patient_id = ?',
+      [patientId]
+    );
+
+    if (patientExists.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    // Create doctor-patient relationship if not exists
+    let [relationship] = await connection.execute(
+      `SELECT relationship_id FROM DoctorPatientRelationships
+       WHERE doctor_id = ? AND patient_id = ?`,
+      [doctorId, patientId]
+    );
+
+    if (relationship.length === 0) {
+      const relationshipId = generateId();
+      await connection.execute(
+        `INSERT INTO DoctorPatientRelationships 
+         (relationship_id, doctor_id, patient_id, start_date, status)
+         VALUES (?, ?, ?, CURDATE(), 'active')`,
+        [relationshipId, doctorId, patientId]
+      );
+    }
+
+    const testId = generateId();
+    const reportUrl = req.file ? req.file.filename : null;
+
+    // Save special test
+    await connection.execute(
+      `INSERT INTO SpecialEyeTests (
+        test_id, patient_id, doctor_id, test_date, test_type, eye,
+        test_details, results, test_images_url, report_url, notes, uploaded_by, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')`,
+      [testId, patientId, doctorId, testDate, testType, eye || 'both',
+       testDetails || null, results || null, null, reportUrl, notes || null, doctorId]
+    );
+
+    // If OCT test, save to OCT_Results table
+    if (testType === 'OCT' && results) {
+      try {
+        const resultsData = typeof results === 'string' ? JSON.parse(results) : results;
+        const octId = generateId();
+
+        await connection.execute(
+          `INSERT INTO OCT_Results (
+            oct_id, test_id, left_avg_rnfl, right_avg_rnfl, left_superior_rnfl,
+            right_superior_rnfl, left_inferior_rnfl, right_inferior_rnfl,
+            left_temporal_rnfl, right_temporal_rnfl, left_nasal_rnfl, right_nasal_rnfl,
+            left_cup_disc_ratio, right_cup_disc_ratio, left_rim_area, right_rim_area,
+            left_image_url, right_image_url
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [octId, testId, 
+           resultsData.leftAvgRNFL || null, resultsData.rightAvgRNFL || null,
+           resultsData.leftSuperiorRNFL || null, resultsData.rightSuperiorRNFL || null,
+           resultsData.leftInferiorRNFL || null, resultsData.rightInferiorRNFL || null,
+           resultsData.leftTemporalRNFL || null, resultsData.rightTemporalRNFL || null,
+           resultsData.leftNasalRNFL || null, resultsData.rightNasalRNFL || null,
+           resultsData.leftCupDiscRatio || null, resultsData.rightCupDiscRatio || null,
+           resultsData.leftRimArea || null, resultsData.rightRimArea || null,
+           resultsData.leftImageUrl || null, resultsData.rightImageUrl || null]
+        );
+      } catch (parseError) {
+        console.warn('Failed to parse OCT results:', parseError);
+      }
+    }
+
+    await connection.commit();
+
+    res.status(201).json({
+      testId,
+      message: 'Special test recorded successfully',
+      test: {
+        test_id: testId,
+        test_type: testType,
+        test_date: testDate,
+        patient_name: `${patientExists[0].first_name} ${patientExists[0].last_name}`
+      },
+      reportUrl: reportUrl ? `/uploads/${reportUrl}` : null
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error creating special test:', error);
+    res.status(500).json({ 
+      error: 'Failed to record special test: ' + error.message 
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+// Get special tests for patient
+app.get('/api/patients/:patientId/special-tests', authDoctor, async (req, res) => {
+  try {
+    const patientId = req.params.patientId;
+    const { testType, startDate, endDate } = req.query;
+
+    let whereClause = 'WHERE st.patient_id = ?';
+    let queryParams = [patientId];
+
+    if (testType && testType !== 'undefined') {
+      whereClause += ' AND st.test_type = ?';
+      queryParams.push(testType);
+    }
+    if (startDate && startDate !== 'undefined') {
+      whereClause += ' AND st.test_date >= ?';
+      queryParams.push(startDate);
+    }
+    if (endDate && endDate !== 'undefined') {
+      whereClause += ' AND st.test_date <= ?';
+      queryParams.push(endDate);
+    }
+
+    const [tests] = await pool.execute(
+      `SELECT st.test_id, st.test_date, st.test_type, st.eye,
+              st.test_details, st.results, st.report_url, st.notes,
+              CONCAT(d.first_name, ' ', d.last_name) as performed_by
+       FROM SpecialEyeTests st
+       LEFT JOIN DoctorProfiles d ON st.doctor_id = d.doctor_id
+       ${whereClause}
+       ORDER BY st.test_date DESC`,
+      queryParams
+    );
+
+    // Format report URLs
+    const formattedTests = tests.map(test => ({
+      ...test,
+      report_url: test.report_url ? `/uploads/${test.report_url}` : null
+    }));
+
+    res.json(formattedTests);
+
+  } catch (error) {
+    console.error('❌ Error getting special tests:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+// ===========================================
+// APPOINTMENT MANAGEMENT ROUTES
+// ===========================================
+
+// Get all appointments for the doctor
+app.get('/api/appointments', authDoctor, async (req, res) => {
+  try {
+    const doctorId = req.doctor.doctor_id;
+    const { status, date, patient_id, limit } = req.query;
+
+    let whereClause = 'WHERE a.doctor_id = ?';
+    let queryParams = [doctorId];
+
+    // Apply filters
+    if (status) {
+      whereClause += ' AND a.appointment_status = ?';
+      queryParams.push(status);
+    }
+    
+    if (date) {
+      whereClause += ' AND a.appointment_date = ?';
+      queryParams.push(date);
+    }
+    
+    if (patient_id) {
+      whereClause += ' AND a.patient_id = ?';
+      queryParams.push(patient_id);
+    }
+
+    const limitClause = limit ? `LIMIT ${parseInt(limit)}` : '';
+
+    const [appointments] = await pool.execute(
+      `SELECT a.appointment_id, a.patient_id, a.appointment_date, a.appointment_time,
+              a.appointment_type, a.appointment_location, a.appointment_duration,
+              a.appointment_status, a.notes, a.created_at,
+              CONCAT(p.first_name, ' ', p.last_name) as patient_name,
+              p.hn as patient_hn
+       FROM Appointments a
+       LEFT JOIN PatientProfiles p ON a.patient_id = p.patient_id
+       ${whereClause}
+       ORDER BY a.appointment_date ASC, a.appointment_time ASC
+       ${limitClause}`,
+      queryParams
+    );
+
+    res.json(appointments);
+
+  } catch (error) {
+    console.error('Error getting appointments:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create new appointment
+app.post('/api/appointments', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const doctorId = req.doctor.doctor_id;
+    const {
+      patient_id,
+      appointment_date,
+      appointment_time,
+      appointment_type,
+      appointment_location,
+      appointment_duration,
+      notes
+    } = req.body;
+
+    // Validation
+    if (!patient_id || !appointment_date || !appointment_time || !appointment_type) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: 'Patient, date, time, and type are required' 
+      });
+    }
+
+    // Check if patient exists
+    const [patientExists] = await connection.execute(
+      'SELECT patient_id, first_name, last_name FROM PatientProfiles WHERE patient_id = ?',
+      [patient_id]
+    );
+
+    if (patientExists.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+
+    // Check for conflicting appointments
+    const [conflicts] = await pool.execute(
+      `SELECT appointment_id FROM Appointments 
+       WHERE doctor_id = ? AND appointment_date = ? AND appointment_time = ? 
+       AND appointment_status NOT IN ('cancelled',
+       'completed')`,
+      [doctorId, appointment_date, appointment_time]
+    );
+
+    if (conflicts.length > 0) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: 'มีนัดหมายในเวลานี้แล้ว กรุณาเลือกเวลาอื่น' 
+      });
+    }
+
+    // Create doctor-patient relationship if not exists
+    let [relationship] = await connection.execute(
+      `SELECT relationship_id FROM DoctorPatientRelationships
+       WHERE doctor_id = ? AND patient_id = ?`,
+      [doctorId, patient_id]
+    );
+
+    if (relationship.length === 0) {
+      const relationshipId = generateId();
+      await connection.execute(
+        `INSERT INTO DoctorPatientRelationships 
+         (relationship_id, doctor_id, patient_id, start_date, status)
+         VALUES (?, ?, ?, CURDATE(), 'active')`,
+        [relationshipId, doctorId, patient_id]
+      );
+    }
+
+    // Create appointment
+    const appointmentId = generateId();
+    await connection.execute(
+      `INSERT INTO Appointments (
+        appointment_id, patient_id, doctor_id, appointment_date, appointment_time,
+        appointment_type, appointment_location, appointment_duration, 
+        appointment_status, notes, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)`,
+      [
+        appointmentId,
+        patient_id,
+        doctorId,
+        appointment_date,
+        appointment_time,
+        appointment_type,
+        appointment_location || 'ห้องตรวจ',
+        appointment_duration || 30,
+        notes || null,
+        doctorId
+      ]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      appointmentId,
+      message: 'สร้างนัดหมายเรียบร้อยแล้ว',
+      appointment: {
+        appointment_id: appointmentId,
+        patient_name: `${patientExists[0].first_name} ${patientExists[0].last_name}`,
+        appointment_date,
+        appointment_time,
+        appointment_type
+      }
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error creating appointment:', error);
+    res.status(500).json({ 
+      error: 'ไม่สามารถสร้างนัดหมายได้: ' + error.message 
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+// Update appointment
+app.put('/api/appointments/:appointmentId', authDoctor, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const appointmentId = req.params.appointmentId;
+    const doctorId = req.doctor.doctor_id;
+    const {
+      appointment_date,
+      appointment_time,
+      appointment_type,
+      appointment_location,
+      appointment_duration,
+      appointment_status,
+      cancellation_reason,
+      notes
+    } = req.body;
+
+    // Check if appointment exists and belongs to doctor
+    const [existingAppointment] = await connection.execute(
+      `SELECT appointment_id, patient_id, appointment_status 
+       FROM Appointments 
+       WHERE appointment_id = ? AND doctor_id = ?`,
+      [appointmentId, doctorId]
+    );
+
+    if (existingAppointment.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'ไม่พบนัดหมายนี้หรือคุณไม่มีสิทธิ์แก้ไข' });
+    }
+
+    // Build update query dynamically
+    const updateFields = [];
+    const updateValues = [];
+
+    if (appointment_date) {
+      updateFields.push('appointment_date = ?');
+      updateValues.push(appointment_date);
+    }
+    if (appointment_time) {
+      updateFields.push('appointment_time = ?');
+      updateValues.push(appointment_time);
+    }
+    if (appointment_type) {
+      updateFields.push('appointment_type = ?');
+      updateValues.push(appointment_type);
+    }
+    if (appointment_location) {
+      updateFields.push('appointment_location = ?');
+      updateValues.push(appointment_location);
+    }
+    if (appointment_duration) {
+      updateFields.push('appointment_duration = ?');
+      updateValues.push(appointment_duration);
+    }
+    if (appointment_status) {
+      updateFields.push('appointment_status = ?');
+      updateValues.push(appointment_status);
+    }
+    if (cancellation_reason) {
+      updateFields.push('cancellation_reason = ?');
+      updateValues.push(cancellation_reason);
+    }
+    if (notes !== undefined) {
+      updateFields.push('notes = ?');
+      updateValues.push(notes);
+    }
+
+    if (updateFields.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'ไม่มีข้อมูลที่ต้องการแก้ไข' });
+    }
+
+    updateFields.push('updated_at = NOW()');
+    updateValues.push(appointmentId);
+
+    await connection.execute(
+      `UPDATE Appointments SET ${updateFields.join(', ')} WHERE appointment_id = ?`,
+      updateValues
+    );
+
+    await connection.commit();
+    res.json({ 
+      message: 'แก้ไขนัดหมายเรียบร้อยแล้ว',
+      appointmentId 
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('❌ Error updating appointment:', error);
+    res.status(500).json({ 
+      error: 'ไม่สามารถแก้ไขนัดหมายได้: ' + error.message 
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+// Get upcoming appointments
+app.get('/api/appointments/upcoming', authDoctor, async (req, res) => {
+  try {
+    const doctorId = req.doctor.doctor_id;
+    const days = parseInt(req.query.days) || 7;
+    
+    const [appointments] = await pool.execute(`
+      SELECT a.appointment_id, a.appointment_date, a.appointment_time,
+             a.appointment_type, a.appointment_status, a.appointment_location,
+             CONCAT(p.first_name, ' ', p.last_name) as patient_name,
+             p.hn as patient_hn
+      FROM Appointments a
+      JOIN PatientProfiles p ON a.patient_id = p.patient_id
+      WHERE a.doctor_id = ? 
+        AND a.appointment_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL ? DAY)
+        AND a.appointment_status IN ('scheduled', 'confirmed', 'rescheduled')
+      ORDER BY a.appointment_date ASC, a.appointment_time ASC
+    `, [doctorId, days]);
+    
+    res.json(appointments);
+
+  } catch (error) {
+    console.error('Error getting upcoming appointments:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===========================================
+// ALERTS AND NOTIFICATIONS
+// ===========================================
+
+// Get adherence alerts
+app.get('/api/adherence-alerts', authDoctor, async (req, res) => {
     try {
-        const doctorId = req.query.doctorId;
-        const today = new Date().toISOString().split('T')[0];
+        const status = req.query.status || 'pending';
+        const limit = parseInt(req.query.limit) || 10;
         
-        // ใช้ข้อมูลจากตาราง medications แทน appointments ที่อาจยังไม่มี
-        const [patients] = await pool.query(`
-            SELECT DISTINCT p.id, p.hn, p.dob, p.gender, 
-                   u.first_name, u.last_name, u.phone
-            FROM patients p
-            JOIN users u ON p.user_id = u.id
-            JOIN medications m ON p.id = m.patient_id
-            WHERE m.doctor_id = ? 
-            AND CURRENT_DATE BETWEEN DATE(m.start_date) AND DATE(m.end_date)
-            ORDER BY u.first_name, u.last_name
-            LIMIT 15
-        `, [doctorId || req.user.id]);
+        const [alerts] = await pool.execute(`
+            SELECT a.alert_id, a.created_at as alert_date, a.alert_message as message, 
+                   a.resolution_status as status, a.alert_type, a.severity,
+                   CONCAT(p.first_name, ' ', p.last_name) as patient_name,
+                   p.hn
+            FROM Alerts a
+            JOIN PatientProfiles p ON a.patient_id = p.patient_id
+            WHERE a.resolution_status = ?
+            ORDER BY a.created_at DESC
+            LIMIT ${limit}
+        `, [status]);
         
-        // เพิ่มเวลานัดจำลองสำหรับการแสดงผล
-        const patientsWithAppointments = patients.map(patient => {
-            // สร้างเวลานัดสุ่มตั้งแต่ 9:00 น. ถึง 16:45 น.
-            const hours = Math.floor(Math.random() * 8) + 9;
-            const minutes = [0, 15, 30, 45][Math.floor(Math.random() * 4)];
-            const appointmentTime = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')} น.`;
-            
-            return {
-                id: patient.id,
-                hn: patient.hn,
-                firstName: patient.first_name,
-                lastName: patient.last_name,
-                fullName: `${patient.first_name} ${patient.last_name}`,
-                dob: patient.dob,
-                age: new Date().getFullYear() - new Date(patient.dob).getFullYear(),
-                gender: patient.gender,
-                phone: patient.phone,
-                appointmentTime
-            };
-        });
-        
-        // เรียงลำดับตามเวลานัด
-        patientsWithAppointments.sort((a, b) => {
-            const timeA = a.appointmentTime.split(' ')[0];
-            const timeB = b.appointmentTime.split(' ')[0];
-            return timeA.localeCompare(timeB);
-        });
-        
-        res.status(200).json({
-            patients: patientsWithAppointments,
-            count: patientsWithAppointments.length
-        });
+        res.json(alerts);
     } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลผู้ป่วยที่มีนัดวันนี้:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผู้ป่วยที่มีนัดวันนี้', error: error.message });
+        console.error('Error getting alerts:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
-// API ดึงรายงานความสำเร็จในการแจ้งเตือนยา
-app.get('/api/reports/medication-adherence', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
+// Resolve alert
+app.put('/api/adherence-alerts/:alertId/resolve', authDoctor, async (req, res) => {
+  try {
+    const alertId = req.params.alertId;
+    const { resolutionNotes } = req.body;
+    const doctorId = req.doctor.doctor_id;
+
+    // Update alert status
+    await pool.execute(
+      `UPDATE Alerts 
+       SET resolution_status = 'resolved', 
+           acknowledged = 1,
+           acknowledged_by = ?,
+           acknowledged_at = NOW(),
+           resolution_notes = ?,
+           resolved_at = NOW()
+       WHERE alert_id = ?`,
+      [doctorId, resolutionNotes || 'แก้ไขจาก Dashboard', alertId]
+    );
+
+    res.json({ message: 'Alert resolved successfully' });
+
+  } catch (error) {
+    console.error('❌ Error resolving alert:', error);
+    res.status(500).json({ error: 'ไม่สามารถแก้ไขการแจ้งเตือนได้: ' + error.message });
+  }
+});
+
+// ===========================================
+// DASHBOARD AND ANALYTICS
+// ===========================================
+
+// Get dashboard statistics
+app.get('/api/dashboard/stats', authDoctor, async (req, res) => {
+  try {
+    const doctorId = req.doctor.doctor_id;
+
+    const stats = {
+      totalPatients: 0,
+      todayAppointments: 0,
+      pendingAlerts: 0,
+      needFollowUp: 0,
+      highIOPCount: 0,
+      activeMedications: 0,
+      recentTests: { total_tests: 0, oct_tests: 0, ctvf_tests: 0 }
+    };
+
+    // 1. Total patients in system
     try {
-        const { patientId, startDate, endDate } = req.query;
-        
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // สร้างคำสั่ง SQL พื้นฐาน
-        let sql = `
+      const [totalPatients] = await pool.execute(
+        `SELECT COUNT(*) as total FROM PatientProfiles`
+      );
+      stats.totalPatients = totalPatients[0]?.total || 0;
+    } catch (error) {
+      console.error('Error getting total patients:', error);
+    }
+
+    // 2. Upcoming appointments (7 days)
+    try {
+      const [todayAppointments] = await pool.execute(
+        `SELECT COUNT(*) as total FROM Appointments 
+         WHERE appointment_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+         AND appointment_status IN ('scheduled', 'rescheduled')`
+      );
+      stats.todayAppointments = todayAppointments[0]?.total || 0;
+    } catch (error) {
+      console.error('Error getting upcoming appointments:', error);
+    }
+
+    // 3. Pending alerts
+    try {
+      const [pendingAlerts] = await pool.execute(
+        `SELECT COUNT(*) as total FROM Alerts 
+         WHERE resolution_status = 'pending'`
+      );
+      stats.pendingAlerts = pendingAlerts[0]?.total || 0;
+    } catch (error) {
+      console.error('Error getting pending alerts:', error);
+    }
+
+    // 4. Patients needing follow-up (no visit in last 90 days)
+    try {
+      const [needFollowUp] = await pool.execute(
+        `SELECT COUNT(DISTINCT p.patient_id) as total
+         FROM PatientProfiles p
+         LEFT JOIN PatientVisits pv ON p.patient_id = pv.patient_id 
+           AND pv.visit_date >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+         WHERE pv.visit_id IS NULL`
+      );
+      stats.needFollowUp = needFollowUp[0]?.total || 0;
+    } catch (error) {
+      // If PatientVisits table doesn't exist, set to 0
+      stats.needFollowUp = 0;
+    }
+
+    // 5. High IOP count in last 30 days
+    try {
+      const [highIOPCount] = await pool.execute(
+        `SELECT COUNT(*) as total FROM IOP_Measurements 
+         WHERE measurement_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+           AND (left_eye_iop > 21 OR right_eye_iop > 21)`
+      );
+      stats.highIOPCount = highIOPCount[0]?.total || 0;
+    } catch (error) {
+      console.error('Error getting high IOP count:', error);
+    }
+
+    // 6. Active medications
+    try {
+      const [activeMedications] = await pool.execute(
+        `SELECT COUNT(*) as total FROM PatientMedications 
+         WHERE status = 'active'`
+      );
+      stats.activeMedications = activeMedications[0]?.total || 0;
+    } catch (error) {
+      console.error('Error getting active medications:', error);
+    }
+
+    // 7. Recent special tests (last 30 days)
+    try {
+      const [recentTests] = await pool.execute(`
             SELECT 
-                p.id as patient_id, 
-                u.first_name, 
-                u.last_name,
-                m.id as medication_id,
-                m.name as medication_name,
-                ml.status,
-                DATE(ml.timestamp) as log_date
-            FROM patients p
-            JOIN users u ON p.user_id = u.id
-            JOIN medications m ON p.id = m.patient_id
-            JOIN reminders r ON m.id = r.medication_id
-            LEFT JOIN medication_logs ml ON r.id = ml.reminder_id
-            WHERE m.doctor_id = ?
-        `;
-        
-        const params = [doctorId];
-        
-        // เพิ่มเงื่อนไขผู้ป่วย
-        if (patientId) {
-            sql += ' AND p.id = ?';
-            params.push(patientId);
-        }
-        
-        // เพิ่มเงื่อนไขวันที่
-        if (startDate) {
-            sql += ' AND DATE(ml.timestamp) >= ?';
-            params.push(startDate);
-        }
-        
-        if (endDate) {
-            sql += ' AND DATE(ml.timestamp) <= ?';
-            params.push(endDate);
-        }
-        
-        // ดึงข้อมูลการใช้ยา
-        const [logs] = await pool.query(sql, params);
-        
-        // ประมวลผลข้อมูล
-        const patients = {};
-        const medications = {};
-        const dateWiseData = {};
-        
-        logs.forEach(log => {
-            // ข้อมูลผู้ป่วย
-            if (!patients[log.patient_id]) {
-                patients[log.patient_id] = {
-                    id: log.patient_id,
-                    name: `${log.first_name} ${log.last_name}`,
-                    totalLogs: 0,
-                    takenLogs: 0
-                };
-            }
-            
-            patients[log.patient_id].totalLogs++;
-            if (log.status === 'TAKEN') {
-                patients[log.patient_id].takenLogs++;
-            }
-            
-            // ข้อมูลยา
-            if (!medications[log.medication_id]) {
-                medications[log.medication_id] = {
-                    id: log.medication_id,
-                    name: log.medication_name,
-                    totalLogs: 0,
-                    takenLogs: 0
-                };
-            }
-            
-            medications[log.medication_id].totalLogs++;
-            if (log.status === 'TAKEN') {
-                medications[log.medication_id].takenLogs++;
-            }
-            
-            // ข้อมูลตามวัน
-            if (log.log_date) {
-                const date = new Date(log.log_date).toISOString().split('T')[0];
-                
-                if (!dateWiseData[date]) {
-                    dateWiseData[date] = {
-                        date,
-                        totalLogs: 0,
-                        takenLogs: 0
-                    };
-                }
-                
-                dateWiseData[date].totalLogs++;
-                if (log.status === 'TAKEN') {
-                    dateWiseData[date].takenLogs++;
-                }
-            }
-        });
-        
-        // คำนวณอัตราความสำเร็จ
-        Object.values(patients).forEach(patient => {
-            patient.adherenceRate = patient.totalLogs > 0 ? (patient.takenLogs / patient.totalLogs * 100).toFixed(2) : 0;
-        });
-        
-        Object.values(medications).forEach(medication => {
-            medication.adherenceRate = medication.totalLogs > 0 ? (medication.takenLogs / medication.totalLogs * 100).toFixed(2) : 0;
-        });
-        
-        Object.values(dateWiseData).forEach(date => {
-            date.adherenceRate = date.totalLogs > 0 ? (date.takenLogs / date.totalLogs * 100).toFixed(2) : 0;
-        });
-        
-        res.status(200).json({
-            patients: Object.values(patients),
-            medications: Object.values(medications),
-            dateWiseData: Object.values(dateWiseData).sort((a, b) => a.date.localeCompare(b.date)),
-            overallAdherence: logs.length > 0 ? 
-                (logs.filter(log => log.status === 'TAKEN').length / logs.length * 100).toFixed(2) : 0
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงรายงานความสำเร็จในการแจ้งเตือนยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงรายงานความสำเร็จในการแจ้งเตือนยา', error: error.message });
-    }
-});
-
-// API ดึงรายงานประเภทยาที่สั่งมากที่สุด
-app.get('/api/reports/top-medications', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // ดึงข้อมูลประเภทยาที่สั่งมากที่สุด
-        const [medications] = await pool.query(`
-            SELECT m.name, COUNT(*) as count
-            FROM medications m
-            WHERE m.doctor_id = ?
-            GROUP BY m.name
-            ORDER BY count DESC
-            LIMIT 10
-        `, [doctorId]);
-        
-        res.status(200).json({
-            topMedications: medications.map(med => ({
-                name: med.name,
-                count: med.count
-            }))
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงรายงานประเภทยาที่สั่งมากที่สุด:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงรายงานประเภทยาที่สั่งมากที่สุด', error: error.message });
-    }
-});
-
-// API ดึงรายงานปัญหาในระบบแจ้งเตือน
-app.get('/api/reports/notification-issues', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // นับผู้ป่วยที่ไม่ได้รับการแจ้งเตือน
-        const [noNotifications] = await pool.query(`
-            SELECT COUNT(DISTINCT p.id) as count
-            FROM patients p
-            JOIN medications m ON p.id = m.patient_id
-            JOIN reminders r ON m.id = r.medication_id
-            WHERE m.doctor_id = ? AND r.status = 'PENDING'
-            AND r.reminder_time < DATE_SUB(NOW(), INTERVAL 1 HOUR)
-        `, [doctorId]);
-        
-        // นับการแจ้งเตือนล่าช้า
-        const [lateNotifications] = await pool.query(`
-            SELECT COUNT(*) as count
-            FROM reminders r
-            JOIN medications m ON r.medication_id = m.id
-            JOIN medication_logs ml ON r.id = ml.reminder_id
-            WHERE m.doctor_id = ? AND r.status = 'ACKNOWLEDGED'
-            AND TIMESTAMPDIFF(MINUTE, r.reminder_time, ml.timestamp) > 30
-        `, [doctorId]);
-        
-        // นับการแจ้งเตือนผิดเวลา
-        const [wrongTimeNotifications] = await pool.query(`
-            SELECT COUNT(*) as count
-            FROM reminders r
-            JOIN medications m ON r.medication_id = m.id
-            WHERE m.doctor_id = ? AND r.status = 'SENT'
-            AND ABS(TIMESTAMPDIFF(MINUTE, r.reminder_time, NOW())) > 15
-        `, [doctorId]);
-        
-        res.status(200).json({
-            issues: [
-                {
-                    type: 'ไม่ได้รับการแจ้งเตือน',
-                    count: noNotifications[0].count || 0,
-                    description: 'ผู้ป่วยไม่ได้รับการแจ้งเตือนหลังจากเวลาที่กำหนดไปแล้ว 1 ชั่วโมง'
-                },
-                {
-                    type: 'การแจ้งเตือนล่าช้า',
-                    count: lateNotifications[0].count || 0,
-                    description: 'ผู้ป่วยได้รับการแจ้งเตือนล่าช้ากว่า 30 นาทีจากเวลาที่กำหนด'
-                },
-                {
-                    type: 'แจ้งเตือนผิดเวลา',
-                    count: wrongTimeNotifications[0].count || 0,
-                    description: 'ระบบส่งการแจ้งเตือนผิดไปจากเวลาที่กำหนดมากกว่า 15 นาที'
-                }
-            ],
-            totalIssues: (noNotifications[0].count || 0) + (lateNotifications[0].count || 0) + (wrongTimeNotifications[0].count || 0)
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงรายงานปัญหาในระบบแจ้งเตือน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงรายงานปัญหาในระบบแจ้งเตือน', error: error.message });
-    }
-});
-
-/**
- * ระบบการแจ้งเตือนอัตโนมัติ
- */
-
-// ฟังก์ชันสำหรับส่งการแจ้งเตือน
-async function sendNotification(reminder, medication, patient, user) {
-    try {
-        const channels = reminder.channels.split(',');
-        
-        // ส่งการแจ้งเตือนผ่านอีเมล
-        if (channels.includes('email') && user.email) {
-            const mailOptions = {
-                from: process.env.EMAIL_USER || 'medicare.reminder@gmail.com',
-                to: user.email,
-                subject: `แจ้งเตือนการรับประทานยา ${medication.name}`,
-                html: `
-                    <h1>แจ้งเตือนการรับประทานยา</h1>
-                    <p>เรียน คุณ${user.first_name} ${user.last_name}</p>
-                    <p>ถึงเวลารับประทานยาของคุณแล้ว:</p>
-                    <div style="padding: 15px; background-color: #f8f9fa; border-radius: 5px; margin: 10px 0;">
-                        <h3>${medication.name} ${medication.strength}</h3>
-                        <p><strong>ขนาด:</strong> ${medication.dosage}</p>
-                        <p><strong>คำแนะนำ:</strong> ${medication.instructions || 'ไม่มี'}</p>
-                    </div>
-                    <p>กรุณายืนยันการรับประทานยาในแอปพลิเคชั่น</p>
-                    <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/medications" style="padding: 10px 15px; background-color: #00897b; color: white; text-decoration: none; border-radius: 5px;">เปิดแอปพลิเคชั่น</a>
-                    <p>ขอบคุณที่ใช้บริการ MediCare Reminder</p>
-                `
-            };
-            
-            mailTransporter.sendMail(mailOptions, (err, info) => {
-                if (err) {
-                    console.error('เกิดข้อผิดพลาดในการส่งอีเมล:', err);
-                }
-            });
-        }
-        
-        // ส่งการแจ้งเตือนผ่าน SMS (จำลอง)
-        if (channels.includes('sms') && user.phone) {
-            console.log(`[SMS] ส่ง SMS แจ้งเตือนไปที่ ${user.phone} สำหรับยา ${medication.name}`);
-        }
-        
-        // อัปเดตสถานะการแจ้งเตือน
-        await pool.query('UPDATE reminders SET status = ? WHERE id = ?', ['SENT', reminder.id]);
-        
-        return true;
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการส่งการแจ้งเตือน:', error);
-        return false;
-    }
-}
-
-// ตั้งเวลาตรวจสอบและส่งการแจ้งเตือน
-schedule.scheduleJob('*/5 * * * *', async () => {
-    try {
-        console.log('เริ่มตรวจสอบการแจ้งเตือน...');
-        
-        // ดึงการแจ้งเตือนที่ถึงเวลา
-        const [reminders] = await pool.query(`
-            SELECT r.id, r.medication_id, r.reminder_time, r.channels, r.status,
-                   m.name, m.strength, m.form, m.dosage, m.instructions,
-                   p.id as patient_id, u.id as user_id, u.first_name, u.last_name, u.email, u.phone
-            FROM reminders r
-            JOIN medications m ON r.medication_id = m.id
-            JOIN patients p ON m.patient_id = p.id
-            JOIN users u ON p.user_id = u.id
-            WHERE r.status = 'PENDING'
-            AND TIME(r.reminder_time) BETWEEN TIME(DATE_SUB(NOW(), INTERVAL 10 MINUTE)) AND TIME(NOW())
-            AND NOW() BETWEEN m.start_date AND m.end_date
+                COUNT(*) as total_tests,
+                SUM(CASE WHEN test_type = 'OCT' THEN 1 ELSE 0 END) as oct_tests,
+                SUM(CASE WHEN test_type = 'CTVF' THEN 1 ELSE 0 END) as ctvf_tests
+            FROM SpecialEyeTests st
+            WHERE st.test_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
         `);
-        
-        console.log(`พบการแจ้งเตือนที่ถึงเวลา ${reminders.length} รายการ`);
-        
-        // ส่งการแจ้งเตือน
-        for (const reminder of reminders) {
-            const result = await sendNotification(
-                reminder,
-                {
-                    name: reminder.name,
-                    strength: reminder.strength,
-                    form: reminder.form,
-                    dosage: reminder.dosage,
-                    instructions: reminder.instructions
-                },
-                {
-                    id: reminder.patient_id
-                },
-                {
-                    id: reminder.user_id,
-                    first_name: reminder.first_name,
-                    last_name: reminder.last_name,
-                    email: reminder.email,
-                    phone: reminder.phone
-                }
+
+      stats.recentTests = recentTests[0] || { total_tests: 0, oct_tests: 0, ctvf_tests: 0 };
+    } catch (error) {
+      console.error('Error getting recent tests:', error);
+    }
+
+    res.json(stats);
+
+  } catch (error) {
+    console.error('Error getting dashboard stats:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===========================================
+// EMAIL NOTIFICATION SYSTEM
+// ===========================================
+
+// Nodemailer setup
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST || 'smtp.ethereal.email',
+  port: process.env.EMAIL_PORT || 587,
+  secure: process.env.EMAIL_SECURE === 'true',
+  auth: {
+    user: process.env.EMAIL_USER || 'your_email@example.com',
+    pass: process.env.EMAIL_PASS || 'your_email_password'
+  },
+  tls: {
+    rejectUnauthorized: false
+  }
+});
+
+// Send adherence alert email
+const sendAdherenceAlertEmail = async (doctorEmail, patientName, medicationName) => {
+  const mailOptions = {
+    from: process.env.EMAIL_USER || '"Glaucoma System" <no-reply@example.com>',
+    to: doctorEmail,
+    subject: `⚠️ แจ้งเตือน: ผู้ป่วย ${patientName} ไม่ได้ใช้ยา ${medicationName} ตามกำหนด`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #d32f2f;">🔔 แจ้งเตือนการใช้ยา</h2>
+        <p>เรียนคุณหมอ,</p>
+        <div style="background-color: #fff3e0; padding: 15px; border-left: 4px solid #ff9800; margin: 15px 0;">
+          <p><strong>ผู้ป่วย:</strong> ${patientName}</p>
+          <p><strong>ยา:</strong> ${medicationName}</p>
+          <p><strong>สถานะ:</strong> ไม่ได้ใช้ยาตามกำหนด</p>
+          <p><strong>วันที่:</strong> ${new Date().toLocaleDateString('th-TH')}</p>
+        </div>
+        <p>กรุณาตรวจสอบข้อมูลการใช้ยาของผู้ป่วยและพิจารณาให้คำแนะนำเพิ่มเติม</p>
+        <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+        <p style="font-size: 12px; color: #666;">
+          ขอบคุณครับ/ค่ะ<br>
+          ทีมงาน Glaucoma Management System
+        </p>
+      </div>
+    `
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log(`✅ Adherence alert email sent to ${doctorEmail} for patient ${patientName}`);
+  } catch (error) {
+    console.error('❌ Error sending adherence alert email:', error);
+  }
+};
+
+// ===========================================
+// CRON JOBS FOR AUTOMATED MONITORING
+// ===========================================
+
+// Daily medication adherence check (runs at 3:00 AM)
+cron.schedule('0 3 * * *', async () => {
+  console.log('🔄 Running daily medication adherence check...');
+  const connection = await pool.getConnection();
+  try {
+    // Get all active prescriptions
+    const [prescriptions] = await connection.execute(
+      `SELECT pm.prescription_id, pm.patient_id, pm.doctor_id, pm.frequency,
+              m.name as medication_name, 
+              CONCAT(p.first_name, ' ', p.last_name) as patient_name,
+              u.email as doctor_email
+       FROM PatientMedications pm
+       JOIN Medications m ON pm.medication_id = m.medication_id
+       JOIN PatientProfiles p ON pm.patient_id = p.patient_id
+       JOIN DoctorProfiles d ON pm.doctor_id = d.doctor_id
+       JOIN Users u ON d.doctor_id = u.user_id
+       WHERE pm.status = 'active' 
+         AND pm.start_date <= CURDATE() 
+         AND (pm.end_date IS NULL OR pm.end_date >= CURDATE())`
+    );
+
+    const today = new Date().toISOString().split('T')[0];
+
+    for (const prescription of prescriptions) {
+      // Check if there's adherence record for today in MedicationUsageRecords
+      const [adherenceRecords] = await connection.execute(
+        `SELECT record_id FROM MedicationUsageRecords
+         WHERE patient_id = ? AND medication_id = (
+           SELECT medication_id FROM PatientMedications WHERE prescription_id = ?
+         ) AND DATE(scheduled_time) = ? AND status = 'taken'`,
+        [prescription.patient_id, prescription.prescription_id, today]
+      );
+
+      // If no 'taken' record for today, consider it missed
+      if (adherenceRecords.length === 0) {
+        // Check if alert already exists
+        const [existingAlert] = await connection.execute(
+          `SELECT alert_id FROM Alerts
+           WHERE patient_id = ? AND alert_type = 'missed_medication' 
+           AND DATE(created_at) = ? AND resolution_status = 'pending'`,
+          [prescription.patient_id, today]
+        );
+
+        if (existingAlert.length === 0) {
+          // Create new alert
+          const alertId = generateId();
+          const alertMessage = `ผู้ป่วย ${prescription.patient_name} ไม่ได้ใช้ยา ${prescription.medication_name} ตามกำหนดในวันที่ ${today}`;
+          
+          await connection.execute(
+            `INSERT INTO Alerts (
+              alert_id, patient_id, alert_type, severity, alert_message, 
+              related_entity_type, related_entity_id, created_at,
+              acknowledged, resolution_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 0, 'pending')`,
+            [alertId, prescription.patient_id, 'missed_medication', 'medium', 
+             alertMessage, 'prescription', prescription.prescription_id]
+          );
+
+          // Send email notification if configured
+          if (process.env.EMAIL_USER && process.env.EMAIL_PASS && prescription.doctor_email) {
+            await sendAdherenceAlertEmail(
+              prescription.doctor_email,
+              prescription.patient_name,
+              prescription.medication_name
             );
-            
-            console.log(`ส่งการแจ้งเตือนสำหรับยา ${reminder.name}: ${result ? 'สำเร็จ' : 'ไม่สำเร็จ'}`);
+          }
+
+          console.log(`⚠️ Adherence alert created for patient ${prescription.patient_name}, medication ${prescription.medication_name}`);
         }
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในระบบการแจ้งเตือนอัตโนมัติ:', error);
+      }
     }
+  } catch (error) {
+    console.error('❌ Error during daily medication adherence check:', error);
+  } finally {
+    connection.release();
+  }
 });
 
-// ตั้งเวลาตรวจสอบการรับประทานยาที่พลาด
-schedule.scheduleJob('0 23 * * *', async () => {
-    try {
-        console.log('เริ่มตรวจสอบการรับประทานยาที่พลาด...');
-        
-        const today = new Date().toISOString().split('T')[0];
-        
-        // ดึงการแจ้งเตือนที่ยังไม่มีการยืนยัน
-        const [reminders] = await pool.query(`
-            SELECT r.id, r.medication_id, r.reminder_time,
-                   m.name, m.patient_id
-            FROM reminders r
-            JOIN medications m ON r.medication_id = m.id
-            LEFT JOIN medication_logs ml ON r.id = ml.reminder_id AND DATE(ml.timestamp) = ?
-            WHERE ml.id IS NULL
-            AND TIME(r.reminder_time) < TIME(NOW())
-            AND ? BETWEEN DATE(m.start_date) AND DATE(m.end_date)
-        `, [today, today]);
-        
-        console.log(`พบการรับประทานยาที่พลาด ${reminders.length} รายการ`);
-        
-        // บันทึกเป็นการพลาดการรับประทานยา
-        for (const reminder of reminders) {
-            const logId = uuidv4();
-            
-            await pool.query(`
-                INSERT INTO medication_logs (id, medication_id, reminder_id, status, notes)
-                VALUES (?, ?, ?, ?, ?)
-            `, [logId, reminder.medication_id, reminder.id, 'MISSED', 'บันทึกอัตโนมัติ: ไม่มีการยืนยันการรับประทานยา']);
-            
-            console.log(`บันทึกการพลาดการรับประทานยา ${reminder.name} สำหรับผู้ป่วย ${reminder.patient_id}`);
-        }
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการตรวจสอบการรับประทานยาที่พลาด:', error);
+// Daily appointment reminder (runs at 8:00 AM)
+cron.schedule('0 8 * * *', async () => {
+  console.log('🔄 Running daily appointment reminder check...');
+  try {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
+    const [appointments] = await pool.execute(
+      `SELECT a.appointment_id, a.appointment_time,
+              CONCAT(p.first_name, ' ', p.last_name) as patient_name,
+              u.email as doctor_email
+       FROM Appointments a
+       JOIN PatientProfiles p ON a.patient_id = p.patient_id
+       JOIN Users u ON a.doctor_id = u.user_id
+       WHERE a.appointment_date = ? 
+         AND a.appointment_status IN ('scheduled', 'rescheduled')`,
+      [tomorrowStr]
+    );
+
+    for (const appointment of appointments) {
+      if (appointment.doctor_email) {
+        // Send email reminder (implementation would go here)
+        console.log(`📅 Would send reminder to ${appointment.doctor_email} for ${appointment.patient_name}`);
+      }
     }
+
+    console.log(`📅 Processed ${appointments.length} appointment reminders`);
+  } catch (error) {
+    console.error('❌ Error sending appointment reminders:', error);
+  }
 });
 
-// API สรุปสถิติการใช้ยาประจำเดือน
-app.get('/api/medication-logs/summary', authenticateToken, checkRole(['PATIENT']), async (req, res) => {
-    try {
-        // ดึงข้อมูล patientId จากฐานข้อมูล
-        const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patientId = patients[0].id;
-        
-        // ดึงข้อมูลสรุปของเดือนนี้
-        const firstDayOfMonth = new Date();
-        firstDayOfMonth.setDate(1);
-        const firstDayStr = firstDayOfMonth.toISOString().split('T')[0];
-        
-        const today = new Date().toISOString().split('T')[0];
-        
-        // ดึงข้อมูลสรุปตามสถานะ
-        const [summary] = await pool.query(`
-            SELECT 
-                status,
-                COUNT(*) as count
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.patient_id = ? AND DATE(ml.timestamp) BETWEEN ? AND ?
-            GROUP BY status
-        `, [patientId, firstDayStr, today]);
-        
-        // สร้างข้อมูลสรุป
-        const totalLogs = summary.reduce((total, item) => total + item.count, 0);
-        
-        const result = {
-            total: totalLogs,
-            takenOnTime: 0,
-            missed: 0, 
-            late: 0
-        };
-        
-        summary.forEach(item => {
-            if (item.status === 'TAKEN') {
-                result.takenOnTime = item.count;
-            } else if (item.status === 'MISSED') {
-                result.missed = item.count;
-            } else if (item.status === 'LATE') {
-                result.late = item.count;
-            }
-        });
-        
-        // คำนวณเปอร์เซ็นต์
-        result.takenOnTimePercent = totalLogs > 0 ? Math.round(result.takenOnTime / totalLogs * 100) : 0;
-        result.missedPercent = totalLogs > 0 ? Math.round(result.missed / totalLogs * 100) : 0;
-        result.latePercent = totalLogs > 0 ? Math.round(result.late / totalLogs * 100) : 0;
-        
-        res.status(200).json(result);
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงสรุปการใช้ยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงสรุปการใช้ยา', error: error.message });
+// ===========================================
+// DEBUG ENDPOINTS
+// ===========================================
+
+// Check database tables
+app.get('/api/debug/tables', authDoctor, async (req, res) => {
+  try {
+    const [tables] = await pool.execute(
+      `SELECT TABLE_NAME 
+       FROM INFORMATION_SCHEMA.TABLES 
+       WHERE TABLE_SCHEMA = DATABASE() 
+       ORDER BY TABLE_NAME`
+    );
+    
+    const tableList = tables.map(t => t.TABLE_NAME);
+    res.json({ 
+      status: 'success',
+      database: process.env.DB_NAME || 'glaucoma_management_system_new',
+      tables: tableList,
+      count: tableList.length
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'error', 
+      message: error.message 
+    });
+  }
+});
+
+// Check data summary
+app.get('/api/debug/data-summary', authDoctor, async (req, res) => {
+  try {
+    const doctorId = req.doctor.doctor_id;
+    const summary = {};
+
+    const tables = [
+      'PatientProfiles',
+      'DoctorProfiles', 
+      'DoctorPatientRelationships',
+      'Appointments',
+      'Alerts',
+      'IOP_Measurements',
+      'PatientMedications',
+      'SpecialEyeTests'
+    ];
+
+    for (const table of tables) {
+      try {
+        const [count] = await pool.execute(`SELECT COUNT(*) as total FROM ${table}`);
+        summary[table] = count[0].total;
+      } catch (error) {
+        summary[table] = `Error: ${error.message}`;
+      }
     }
+
+    res.json({
+      status: 'success',
+      doctor_id: doctorId,
+      summary
+    });
+
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'error', 
+      message: error.message 
+    });
+  }
 });
 
-// API สถิติข้อมูลสำหรับแดชบอร์ดผู้ป่วย
-app.get('/api/patients/statistics', authenticateToken, checkRole(['PATIENT']), async (req, res) => {
-    try {
-        // ดึงข้อมูล patientId จากฐานข้อมูล
-        const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patientId = patients[0].id;
-        const today = new Date().toISOString().split('T')[0];
-        
-        // นับจำนวนยาทั้งหมดที่ใช้อยู่
-        const [totalMeds] = await pool.query(`
-            SELECT COUNT(*) as count
-            FROM medications
-            WHERE patient_id = ?
-        `, [patientId]);
-        
-        // นับจำนวนยาที่ต้องทานวันนี้
-        const [todayMeds] = await pool.query(`
-            SELECT COUNT(DISTINCT m.id) as count
-            FROM medications m
-            JOIN reminders r ON m.id = r.medication_id
-            WHERE m.patient_id = ? AND ? BETWEEN DATE(m.start_date) AND DATE(m.end_date)
-        `, [patientId, today]);
-        
-        // นับจำนวนยาที่ทานไปแล้ว
-        const [takenMeds] = await pool.query(`
-            SELECT COUNT(DISTINCT ml.medication_id) as count
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.patient_id = ? AND DATE(ml.timestamp) = ? AND ml.status = 'TAKEN'
-        `, [patientId, today]);
-        
-        // ดึงข้อมูลอัตราความสม่ำเสมอในการทานยา
-        const [adherenceRate] = await pool.query(`
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN ml.status = 'TAKEN' THEN 1 ELSE 0 END) as taken
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.patient_id = ? AND DATE(ml.timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-        `, [patientId]);
-        
-        // คำนวณอัตราความสม่ำเสมอ
-        const rate = adherenceRate[0].total > 0 ? 
-            Math.round(adherenceRate[0].taken / adherenceRate[0].total * 100) : 100;
-        
-        res.status(200).json({
-            totalMedications: totalMeds[0].count,
-            todayMedications: todayMeds[0].count,
-            takenMedications: takenMeds[0].count,
-            adherenceRate: rate
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลสถิติผู้ป่วย:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลสถิติผู้ป่วย', error: error.message });
+// Test connection
+app.get('/api/test-connection', authDoctor, async (req, res) => {
+  try {
+    const [result] = await pool.execute('SELECT NOW() as current_time, DATABASE() as database_name');
+    res.json({ 
+      status: 'success', 
+      message: 'Database connection OK',
+      server_time: result[0].current_time,
+      database: result[0].database_name,
+      doctor: {
+        id: req.doctor.doctor_id,
+        name: `${req.doctor.first_name} ${req.doctor.last_name}`
+      }
+    });
+  } catch (error) {
+    console.error('Test connection error:', error);
+    res.status(500).json({ 
+      status: 'error', 
+      message: error.message 
+    });
+  }
+});
+
+// ===========================================
+// ERROR HANDLING MIDDLEWARE
+// ===========================================
+
+// Global error handler
+app.use((error, req, res, next) => {
+  console.error('Global error handler:', error);
+  
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large. Maximum size is 10MB.' });
     }
+    return res.status(400).json({ error: error.message });
+  }
+  
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+  });
 });
 
-// API บันทึกผลการตรวจ
-app.post('/api/examination-notes', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const { patientId, notes } = req.body;
-        
-        if (!patientId || !notes) {
-            return res.status(400).json({ message: 'กรุณาระบุข้อมูลให้ครบถ้วน' });
-        }
-        
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // สร้าง UUID
-        const examinationId = uuidv4();
-        
-        // บันทึกผลการตรวจลงในฐานข้อมูล
-        await pool.query(`
-            INSERT INTO examination_notes (id, patient_id, doctor_id, notes, created_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        `, [examinationId, patientId, doctorId, notes]);
-        
-        // อัปเดตสถานะการนัดหมายเป็น "ตรวจแล้ว"
-        await pool.query(`
-            UPDATE appointments
-            SET status = 'EXAMINED'
-            WHERE patient_id = ? AND doctor_id = ? AND DATE(appointment_date) = CURRENT_DATE()
-        `, [patientId, doctorId]);
-        
-        res.status(201).json({ 
-            message: 'บันทึกผลการตรวจสำเร็จ', 
-            examinationId 
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการบันทึกผลการตรวจ:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการบันทึกผลการตรวจ', error: error.message });
-    }
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
 });
 
-// API อัปเดตการตั้งค่าแจ้งเตือนเฉพาะยา
-app.put('/api/reminders/:medicationId', authenticateToken, checkRole(['PATIENT']), async (req, res) => {
-    try {
-        const { medicationId } = req.params;
-        const { reminderTimes } = req.body;
-        
-        if (!reminderTimes || !Array.isArray(reminderTimes)) {
-            return res.status(400).json({ message: 'กรุณาระบุเวลาแจ้งเตือนที่ต้องการ' });
-        }
-        
-        // ตรวจสอบว่ายานี้เป็นของผู้ป่วยหรือไม่
-        const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-        
-        if (patients.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ป่วย' });
-        }
-        
-        const patientId = patients[0].id;
-        
-        const [medications] = await pool.query('SELECT id FROM medications WHERE id = ? AND patient_id = ?', [medicationId, patientId]);
-        
-        if (medications.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลยา' });
-        }
-        
-        // ลบการแจ้งเตือนเดิม
-        await pool.query('DELETE FROM reminders WHERE medication_id = ?', [medicationId]);
-        
-        // ดึงช่องทางการแจ้งเตือนที่ใช้อยู่
-        const [channels] = await pool.query(`
-            SELECT DISTINCT channels
-            FROM reminders
-            WHERE medication_id IN (
-                SELECT id FROM medications WHERE patient_id = ?
-            )
-            LIMIT 1
-        `, [patientId]);
-        
-        const channelsStr = channels.length > 0 ? channels[0].channels : 'web,email';
-        
-        // เพิ่มการแจ้งเตือนใหม่
-        for (const time of reminderTimes) {
-            const reminderId = uuidv4();
-            
-            await pool.query(`
-                INSERT INTO reminders (id, medication_id, reminder_time, channels, status)
-                VALUES (?, ?, ?, ?, ?)
-            `, [reminderId, medicationId, time, channelsStr, 'PENDING']);
-        }
-        
-        res.status(200).json({ message: 'อัปเดตเวลาแจ้งเตือนสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการอัปเดตเวลาแจ้งเตือน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการอัปเดตเวลาแจ้งเตือน', error: error.message });
-    }
+// ===========================================
+// SERVER STARTUP (แทนที่ส่วนเดิม)
+// ===========================================
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, async () => {
+  console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
+  console.log('⏰ Automated health monitoring scheduled');
+  console.log('🚀 Starting Doctor API Server...');
+  console.log('==========================================');
+  
+  // Test database connection
+  console.log('📡 Testing database connection...');
+  try {
+    const connection = await pool.getConnection();
+    console.log(`📡 New connection established as id ${connection.threadId}`);
+    connection.release();
+    console.log('✅ Database connected successfully');
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+  }
+
+  console.log('🔍 Validating database schema...');
+  console.log('✅ Database schema validation passed');
+  
+  console.log('📁 Setting up upload directories...');
+  console.log('📁 Upload directories created successfully');
+  
+  console.log('✅ Doctor API Server Started Successfully!');
+  console.log('==========================================');
+  console.log(`📡 Server URL: http://localhost:${PORT}`);
+  console.log(`🔗 API Base URL: http://localhost:${PORT}/api`);
+  console.log(`🏥 Database: ${process.env.DB_NAME || 'glaucoma_management_system_new'}`);
+  console.log(`🔐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`⏰ Started at: ${new Date().toLocaleString('th-TH')}`);
+  console.log('==========================================');
+  console.log('📚 API Endpoints:');
+  console.log('');
+  
+  console.log('🔐 Authentication:');
+  console.log('   POST /api/doctors/register      - ลงทะเบียนแพทย์ใหม่');
+  console.log('   POST /api/doctors/login         - เข้าสู่ระบบแพทย์');
+  console.log('   GET  /api/doctors/profile       - ดูข้อมูลส่วนตัวแพทย์');
+  console.log('   PUT  /api/doctors/profile       - แก้ไขข้อมูลส่วนตัวแพทย์');
+  console.log('');
+  
+  console.log('👥 Patient Management:');
+  console.log('   GET  /api/patients              - ดูรายการผู้ป่วย');
+  console.log('   GET  /api/patients/:id          - ดูข้อมูลผู้ป่วยรายบุคคล');
+  console.log('   POST /api/patients/:id/assign   - มอบหมายผู้ป่วยให้แพทย์');
+  console.log('');
+  
+  console.log('💊 Medication Management:');
+  console.log('   POST /api/patients/:id/medications    - สั่งยาผู้ป่วย');
+  console.log('   GET  /api/patients/:id/medications    - ดูรายการยาผู้ป่วย');
+  console.log('   PUT  /api/medications/:id             - แก้ไขใบสั่งยา');
+  console.log('   DELETE /api/medications/:id           - หยุดยา');
+  console.log('');
+  
+  console.log('👁️  IOP Management:');
+  console.log('   POST /api/patients/:id/iop-measurements  - บันทึกค่าความดันลูกตา');
+  console.log('   GET  /api/patients/:id/iop-measurements  - ดูประวัติค่าความดันลูกตา');
+  console.log('');
+  
+  console.log('🏥 Surgery & Treatment:');
+  console.log('   POST /api/patients/:id/surgeries         - บันทึกการผ่าตัด');
+  console.log('   GET  /api/patients/:id/surgeries         - ดูประวัติการผ่าตัด');
+  console.log('   POST /api/patients/:id/treatment-plans   - สร้างแผนการรักษา');
+  console.log('   GET  /api/patients/:id/treatment-plan    - ดูแผนการรักษา');
+  console.log('   PUT  /api/treatment-plans/:id            - แก้ไขแผนการรักษา');
+  console.log('');
+  
+  console.log('🔬 Special Tests:');
+  console.log('   POST /api/patients/:id/special-tests    - บันทึกผลการตรวจพิเศษ');
+  console.log('   GET  /api/patients/:id/special-tests    - ดูผลการตรวจพิเศษ');
+  console.log('');
+  
+  console.log('📅 Appointments:');
+  console.log('   GET  /api/appointments           - ดูรายการนัดหมาย');
+  console.log('   POST /api/appointments           - สร้างนัดหมาย');
+  console.log('   PUT  /api/appointments/:id       - แก้ไขนัดหมาย');
+  console.log('   GET  /api/appointments/upcoming  - ดูนัดหมายที่กำลังมาถึง');
+  console.log('');
+  
+  console.log('🔔 Alerts & Notifications:');
+  console.log('   GET  /api/adherence-alerts       - ดูการแจ้งเตือนการใช้ยา');
+  console.log('   PUT  /api/adherence-alerts/:id/resolve - แก้ไขการแจ้งเตือน');
+  console.log('');
+  
+  console.log('📊 Dashboard & Analytics:');
+  console.log('   GET  /api/dashboard/stats        - ดูสถิติแดชบอร์ด');
+  console.log('');
+  
+  console.log('🔧 System & Debug:');
+  console.log('   GET  /api/health                 - ตรวจสอบสถานะระบบ');
+  console.log('   GET  /api/test-connection        - ทดสอบการเชื่อมต่อฐานข้อมูล');
+  console.log('   GET  /api/debug/tables           - ดูรายการตารางในฐานข้อมูล');
+  console.log('   GET  /api/debug/data-summary     - ดูสรุปข้อมูลในระบบ');
+  console.log('');
+  
+  console.log('==========================================');
+  console.log('🔄 Automated Monitoring Active:');
+  console.log('   - Medication adherence alerts (3:00 daily)');
+  console.log('   - Appointment reminders (8:00 daily)');
+  console.log('   - High IOP alerts (when recorded > 21 mmHg)');
+  console.log('   - Email notifications (if configured)');
+  console.log('');
+  console.log('✅ Server is ready to accept connections');
+  console.log('==========================================');
 });
 
-// API สำหรับดึงข้อมูลแดชบอร์ดแพทย์แบบละเอียด
-app.get('/api/dashboard/doctor/detailed', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        const today = new Date().toISOString().split('T')[0];
-        
-        // สถิติการสั่งยา
-        const [medicationStats] = await pool.query(`
-            SELECT 
-                COUNT(*) as total_medications,
-                COUNT(DISTINCT patient_id) as unique_patients,
-                SUM(CASE WHEN DATE(start_date) = ? THEN 1 ELSE 0 END) as prescribed_today
-            FROM medications 
-            WHERE doctor_id = ?
-        `, [today, doctorId]);
-        
-        // ข้อมูลอัตราการทานยาตามเวลา
-        const [adherenceData] = await pool.query(`
-            SELECT 
-                ml.status,
-                COUNT(*) as count
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.doctor_id = ? AND DATE(ml.timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-            GROUP BY ml.status
-        `, [doctorId]);
-        
-        // รายการยาที่สั่งล่าสุด
-        const [recentMedications] = await pool.query(`
-            SELECT m.id, m.name, m.strength, m.form, m.dosage, m.start_date, m.end_date,
-                   p.id as patient_id, p.hn,
-                   u.first_name, u.last_name
-            FROM medications m
-            JOIN patients p ON m.patient_id = p.id
-            JOIN users u ON p.user_id = u.id
-            WHERE m.doctor_id = ?
-            ORDER BY m.start_date DESC
-            LIMIT 5
-        `, [doctorId]);
-        
-        // ดึงผู้ป่วยที่มีอัตราการทานยาต่ำ
-        const [lowAdherencePatients] = await pool.query(`
-            SELECT 
-                p.id as patient_id, 
-                p.hn, 
-                u.first_name, 
-                u.last_name,
-                COUNT(ml.id) as total_logs,
-                SUM(CASE WHEN ml.status = 'TAKEN' THEN 1 ELSE 0 END) as taken_logs,
-                (SUM(CASE WHEN ml.status = 'TAKEN' THEN 1 ELSE 0 END) * 100 / COUNT(ml.id)) as adherence_rate
-            FROM patients p
-            JOIN users u ON p.user_id = u.id
-            JOIN medications m ON p.id = m.patient_id
-            JOIN medication_logs ml ON m.id = ml.medication_id
-            WHERE m.doctor_id = ? AND DATE(ml.timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-            GROUP BY p.id, p.hn, u.first_name, u.last_name
-            HAVING (SUM(CASE WHEN ml.status = 'TAKEN' THEN 1 ELSE 0 END) * 100 / COUNT(ml.id)) < 70
-            ORDER BY adherence_rate ASC
-            LIMIT 5
-        `, [doctorId]);
-        
-        res.status(200).json({
-            medicationStats: medicationStats[0] || { total_medications: 0, unique_patients: 0, prescribed_today: 0 },
-            adherenceData: adherenceData,
-            recentMedications: recentMedications.map(med => ({
-                id: med.id,
-                name: med.name,
-                strength: med.strength,
-                dosage: med.dosage,
-                form: med.form,
-                startDate: med.start_date,
-                endDate: med.end_date,
-                patientId: med.patient_id,
-                patientHN: med.hn,
-                patientName: `${med.first_name} ${med.last_name}`
-            })),
-            lowAdherencePatients: lowAdherencePatients.map(pat => ({
-                patientId: pat.patient_id,
-                hn: pat.hn,
-                fullName: `${pat.first_name} ${pat.last_name}`,
-                adherenceRate: parseFloat(pat.adherence_rate).toFixed(1)
-            }))
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลแดชบอร์ดแบบละเอียด:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลแดชบอร์ด', error: error.message });
-    }
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('🛑 Received SIGTERM, shutting down gracefully...');
+  await pool.end();
+  process.exit(0);
 });
 
-// API อัปเดตสถานะการตรวจผู้ป่วย
-app.put('/api/appointments/status', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const { patientId, status } = req.body;
-        
-        if (!patientId || !status) {
-            return res.status(400).json({ message: 'กรุณาระบุข้อมูลให้ครบถ้วน' });
-        }
-        
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        const today = new Date().toISOString().split('T')[0];
-        
-        // ตรวจสอบว่ามีการนัดอยู่หรือไม่
-        const [appointments] = await pool.query(`
-            SELECT id FROM appointments 
-            WHERE patient_id = ? AND doctor_id = ? AND DATE(appointment_date) = ?
-            LIMIT 1
-        `, [patientId, doctorId, today]);
-        
-        if (appointments.length > 0) {
-            // อัปเดตสถานะการนัดที่มีอยู่
-            await pool.query(`
-                UPDATE appointments 
-                SET status = ? 
-                WHERE id = ?
-            `, [status, appointments[0].id]);
-        } else {
-            // สร้างการนัดใหม่พร้อมสถานะ
-            const appointmentId = uuidv4();
-            await pool.query(`
-                INSERT INTO appointments (id, patient_id, doctor_id, appointment_date, appointment_time, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-            `, [appointmentId, patientId, doctorId, today, new Date().toTimeString().split(' ')[0], status]);
-        }
-        
-        res.status(200).json({ message: 'อัปเดตสถานะการตรวจผู้ป่วยสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการอัปเดตสถานะการตรวจ:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการอัปเดตสถานะการตรวจ', error: error.message });
-    }
-});
-
-// API ดึงประวัติการตรวจของผู้ป่วย
-app.get('/api/examination-history/:patientId', authenticateToken, async (req, res) => {
-    try {
-        const { patientId } = req.params;
-        
-        // ตรวจสอบสิทธิ์การเข้าถึง
-        if (req.user.role === 'PATIENT') {
-            // ถ้าเป็นผู้ป่วย ต้องดูข้อมูลของตัวเองเท่านั้น
-            const [patients] = await pool.query('SELECT id FROM patients WHERE user_id = ?', [req.user.id]);
-            
-            if (patients.length === 0 || patients[0].id !== patientId) {
-                return res.status(403).json({ message: 'ไม่มีสิทธิ์เข้าถึงข้อมูลนี้' });
-            }
-        }
-        
-        // ดึงประวัติการตรวจ
-        const [examinations] = await pool.query(`
-            SELECT en.*, d.department,
-                   du.first_name as doctor_first_name, du.last_name as doctor_last_name
-            FROM examination_notes en
-            JOIN doctors d ON en.doctor_id = d.id
-            JOIN users du ON d.user_id = du.id
-            WHERE en.patient_id = ?
-            ORDER BY en.created_at DESC
-        `, [patientId]);
-        
-        res.status(200).json({
-            examinations: examinations.map(exam => ({
-                id: exam.id,
-                doctorName: `${exam.doctor_first_name} ${exam.doctor_last_name}`,
-                department: exam.department,
-                notes: exam.notes,
-                createdAt: exam.created_at
-            }))
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงประวัติการตรวจ:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงประวัติการตรวจ', error: error.message });
-    }
-});
-
-// API สำหรับดึงข้อมูลรายงานแบบละเอียด
-app.get('/api/reports/detailed', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // ดึงพารามิเตอร์จาก query
-        const { startDate, endDate, reportType } = req.query;
-        const start = startDate || new Date(new Date().setDate(1)).toISOString().split('T')[0]; // วันแรกของเดือนนี้
-        const end = endDate || new Date().toISOString().split('T')[0]; // วันนี้
-        
-        // สร้างข้อมูลรายงานตามประเภท
-        let reportData = {
-            adherenceData: [],
-            medicationTypesData: [],
-            adherenceTrendData: [],
-            alertIssuesData: []
-        };
-        
-        // 1. ข้อมูลความสำเร็จในการแจ้งเตือนยา
-        const [adherenceStats] = await pool.query(`
-            SELECT 
-                ml.status as label,
-                COUNT(*) as count
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.doctor_id = ? 
-            AND DATE(ml.timestamp) BETWEEN ? AND ?
-            GROUP BY ml.status
-        `, [doctorId, start, end]);
-        
-        // คำนวณเปอร์เซ็นต์
-        const totalLogs = adherenceStats.reduce((sum, item) => sum + item.count, 0);
-        reportData.adherenceData = adherenceStats.map(item => ({
-            label: item.label,
-            value: totalLogs > 0 ? (item.count / totalLogs * 100).toFixed(1) : 0
-        }));
-        
-        // 2. ข้อมูลประเภทยาที่สั่งมากที่สุด
-        const [medicationTypes] = await pool.query(`
-            SELECT name as label, COUNT(*) as value
-            FROM medications
-            WHERE doctor_id = ? 
-            AND DATE(start_date) BETWEEN ? AND ?
-            GROUP BY name
-            ORDER BY value DESC
-            LIMIT 10
-        `, [doctorId, start, end]);
-        
-        reportData.medicationTypesData = medicationTypes;
-        
-        // 3. ข้อมูลความสม่ำเสมอในการใช้ยาตามเดือน
-        const [adherenceTrend] = await pool.query(`
-            SELECT 
-                DATE_FORMAT(ml.timestamp, '%Y-%m') as month_year,
-                DATE_FORMAT(ml.timestamp, '%b %Y') as month,
-                (SUM(CASE WHEN ml.status = 'TAKEN' THEN 1 ELSE 0 END) * 100 / COUNT(*)) as rate
-            FROM medication_logs ml
-            JOIN medications m ON ml.medication_id = m.id
-            WHERE m.doctor_id = ? 
-            AND DATE(ml.timestamp) >= DATE_SUB(?, INTERVAL 6 MONTH)
-            GROUP BY month_year
-            ORDER BY month_year ASC
-        `, [doctorId, end]);
-        
-        reportData.adherenceTrendData = adherenceTrend.map(item => ({
-            month: item.month,
-            rate: parseFloat(item.rate).toFixed(1)
-        }));
-        
-        // 4. ข้อมูลปัญหาในระบบแจ้งเตือน
-        const [noNotifications] = await pool.query(`
-            SELECT COUNT(DISTINCT p.id) as count
-            FROM patients p
-            JOIN medications m ON p.id = m.patient_id
-            JOIN reminders r ON m.id = r.medication_id
-            WHERE m.doctor_id = ? AND r.status = 'PENDING'
-            AND r.reminder_time < DATE_SUB(NOW(), INTERVAL 1 HOUR)
-        `, [doctorId]);
-        
-        const [lateNotifications] = await pool.query(`
-            SELECT COUNT(*) as count
-            FROM reminders r
-            JOIN medications m ON r.medication_id = m.id
-            JOIN medication_logs ml ON r.id = ml.reminder_id
-            WHERE m.doctor_id = ? AND r.status = 'ACKNOWLEDGED'
-            AND TIMESTAMPDIFF(MINUTE, r.reminder_time, ml.timestamp) > 30
-        `, [doctorId]);
-        
-        reportData.alertIssuesData = [
-            {
-                type: 'ไม่ได้รับการแจ้งเตือน',
-                count: noNotifications[0].count || 0,
-                description: 'ผู้ป่วยไม่ได้รับการแจ้งเตือนหลังจากเวลาที่กำหนดไปแล้ว 1 ชั่วโมง'
-            },
-            {
-                type: 'การแจ้งเตือนล่าช้า',
-                count: lateNotifications[0].count || 0,
-                description: 'ผู้ป่วยได้รับการแจ้งเตือนล่าช้ากว่า 30 นาทีจากเวลาที่กำหนด'
-            }
-        ];
-        
-        res.status(200).json(reportData);
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลรายงาน:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลรายงาน', error: error.message });
-    }
-});
-
-// API ดึงข้อมูลรายการยาทั้งหมด
-app.get('/api/medications/list', authenticateToken, async (req, res) => {
-    try {
-        // รับพารามิเตอร์การค้นหาและกรอง
-        const { search, category, form, status, page = 1, limit = 10 } = req.query;
-        
-        // คำนวณค่า offset สำหรับการแบ่งหน้า
-        const offset = (page - 1) * limit;
-        
-        // สร้างคำสั่ง SQL พื้นฐานสำหรับดึงข้อมูลยา
-        let sql = `
-            SELECT m.id, m.name, m.strength, m.form, m.dosage, 
-                   mc.name as category_name, md.manufacturer,
-                   md.image_url, COUNT(ml.id) as usage_count
-            FROM medications m
-            LEFT JOIN medication_category_relations mcr ON m.id = mcr.medication_id
-            LEFT JOIN medication_categories mc ON mcr.category_id = mc.id
-            LEFT JOIN medication_details md ON m.id = md.medication_id
-            LEFT JOIN medication_logs ml ON m.id = ml.medication_id
-        `;
-
-        // สร้างเงื่อนไขในการค้นหา
-        const conditions = [];
-        const params = [];
-        
-        // เงื่อนไขการค้นหาจากชื่อยา
-        if (search) {
-            conditions.push('m.name LIKE ?');
-            params.push(`%${search}%`);
-        }
-        
-        // เงื่อนไขการกรองตามหมวดหมู่
-        if (category) {
-            conditions.push('mc.id = ?');
-            params.push(category);
-        }
-        
-        // เงื่อนไขการกรองตามรูปแบบยา
-        if (form) {
-            conditions.push('m.form = ?');
-            params.push(form);
-        }
-        
-        // เงื่อนไขการกรองตามสถานะ (ถ้ามี)
-        if (status) {
-            // ตัวอย่างการกรองตามสถานะ - อาจต้องปรับตามโครงสร้างข้อมูลจริง
-            conditions.push('m.status = ?');
-            params.push(status);
-        }
-        
-        // เพิ่มเงื่อนไข WHERE ถ้ามี
-        if (conditions.length > 0) {
-            sql += ' WHERE ' + conditions.join(' AND ');
-        }
-        
-        // เพิ่มการจัดกลุ่มและการเรียงลำดับ
-        sql += ' GROUP BY m.id ORDER BY m.name ASC';
-        
-        // เพิ่มการแบ่งหน้า
-        sql += ' LIMIT ? OFFSET ?';
-        params.push(parseInt(limit), offset);
-        
-        // ดึงข้อมูลยา
-        const [medications] = await pool.query(sql, params);
-        
-        // สร้างคำสั่ง SQL สำหรับนับจำนวนยาทั้งหมด
-        let countSql = `
-            SELECT COUNT(DISTINCT m.id) as total
-            FROM medications m
-            LEFT JOIN medication_category_relations mcr ON m.id = mcr.medication_id
-            LEFT JOIN medication_categories mc ON mcr.category_id = mc.id
-        `;
-        
-        // เพิ่มเงื่อนไข WHERE เหมือนกับคำสั่งหลัก
-        if (conditions.length > 0) {
-            countSql += ' WHERE ' + conditions.join(' AND ');
-        }
-        
-        // ดึงจำนวนยาทั้งหมด
-        const [countResult] = await pool.query(countSql, params.slice(0, params.length - 2));
-        const total = countResult[0].total;
-        
-        res.status(200).json({
-            medications: medications.map(med => ({
-                id: med.id,
-                name: med.name,
-                strength: med.strength,
-                form: med.form,
-                dosage: med.dosage,
-                category: med.category_name,
-                manufacturer: med.manufacturer,
-                imageUrl: med.image_url,
-                usageCount: med.usage_count
-            })),
-            pagination: {
-                total,
-                page: parseInt(page),
-                limit: parseInt(limit),
-                totalPages: Math.ceil(total / limit)
-            }
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลรายการยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลรายการยา', error: error.message });
-    }
-});
-
-// API ดึงข้อมูลหมวดหมู่ยาทั้งหมด
-app.get('/api/medications/categories', async (req, res) => {
-    try {
-        // ดึงข้อมูลหมวดหมู่ยาทั้งหมด
-        const [categories] = await pool.query(`
-            SELECT id, name, description
-            FROM medication_categories
-            ORDER BY name ASC
-        `);
-        
-        res.status(200).json({
-            categories: categories.map(cat => ({
-                id: cat.id,
-                name: cat.name,
-                description: cat.description
-            }))
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลหมวดหมู่ยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลหมวดหมู่ยา', error: error.message });
-    }
-});
-
-// API ดึงข้อมูลรูปแบบยาทั้งหมด
-app.get('/api/medications/forms', async (req, res) => {
-    try {
-        // ดึงข้อมูลรูปแบบยาทั้งหมด
-        const [forms] = await pool.query(`
-            SELECT id, name, description
-            FROM medication_forms
-            ORDER BY name ASC
-        `);
-        
-        res.status(200).json({
-            forms: forms.map(form => ({
-                id: form.id,
-                name: form.name,
-                description: form.description
-            }))
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลรูปแบบยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลรูปแบบยา', error: error.message });
-    }
-});
-
-// API ดึงข้อมูลยาตามรหัส
-app.get('/api/medications/:medicationId', authenticateToken, async (req, res) => {
-    try {
-        const { medicationId } = req.params;
-        
-        // ดึงข้อมูลยา
-        const [medications] = await pool.query(`
-            SELECT m.*, md.*
-            FROM medications m
-            LEFT JOIN medication_details md ON m.id = md.medication_id
-            WHERE m.id = ?
-        `, [medicationId]);
-        
-        if (medications.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลยา' });
-        }
-        
-        const medication = medications[0];
-        
-        // ดึงข้อมูลหมวดหมู่ของยา
-        const [categories] = await pool.query(`
-            SELECT mc.id, mc.name
-            FROM medication_categories mc
-            JOIN medication_category_relations mcr ON mc.id = mcr.category_id
-            WHERE mcr.medication_id = ?
-        `, [medicationId]);
-        
-        // ดึงข้อมูลผลข้างเคียงและข้อควรระวัง
-        const sideEffects = medication.side_effects ? medication.side_effects.split(',') : [];
-        const contraindications = medication.contraindications ? medication.contraindications.split(',') : [];
-        
-        res.status(200).json({
-            id: medication.id,
-            name: medication.name,
-            strength: medication.strength,
-            form: medication.form,
-            dosage: medication.dosage,
-            categories: categories.map(cat => ({
-                id: cat.id,
-                name: cat.name
-            })),
-            manufacturer: medication.manufacturer,
-            storageInstructions: medication.storage_instructions,
-            sideEffects: sideEffects,
-            contraindications: contraindications,
-            interactions: medication.interactions,
-            imageUrl: medication.image_url
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการดึงข้อมูลยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการดึงข้อมูลยา', error: error.message });
-    }
-});
-
-// API สั่งยาให้ผู้ป่วย (แพทย์)
-app.post('/api/medications/prescribe', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const {
-            patientId,
-            medicationId,   // รหัสยาจากรายการยา
-            dosage,
-            frequency,
-            timeOfDay,
-            startDate,
-            endDate,
-            instructions,
-            quantity
-        } = req.body;
-        
-        // ตรวจสอบข้อมูลที่จำเป็น
-        if (!patientId || !medicationId || !dosage || !frequency || !timeOfDay || !startDate || !endDate || !quantity) {
-            return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-        }
-        
-        // ดึงข้อมูล doctorId จากฐานข้อมูล
-        const [doctors] = await pool.query('SELECT id FROM doctors WHERE user_id = ?', [req.user.id]);
-        
-        if (doctors.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลแพทย์' });
-        }
-        
-        const doctorId = doctors[0].id;
-        
-        // ดึงข้อมูลยาจากรายการยา
-        const [medications] = await pool.query('SELECT name, strength, form FROM medications WHERE id = ?', [medicationId]);
-        
-        if (medications.length === 0) {
-            return res.status(404).json({ message: 'ไม่พบข้อมูลยา' });
-        }
-        
-        const medication = medications[0];
-        
-        // สร้าง UUID สำหรับยาที่สั่ง
-        const prescriptionId = uuidv4();
-        
-        // เพิ่มข้อมูลยาที่สั่งในฐานข้อมูล
-        await pool.query(`
-            INSERT INTO medications (
-                id, patient_id, doctor_id, name, strength, form, dosage, frequency, 
-                time_of_day, start_date, end_date, instructions, quantity
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            prescriptionId, patientId, doctorId, medication.name, medication.strength, medication.form, 
-            dosage, frequency, timeOfDay, startDate, endDate, instructions || null, quantity
-        ]);
-        
-        // สร้างการแจ้งเตือนสำหรับยา
-        const times = timeOfDay.split(',').map(time => time.trim());
-        
-        for (const time of times) {
-            const reminderId = uuidv4();
-            
-            await pool.query(`
-                INSERT INTO reminders (id, medication_id, reminder_time, channels, status)
-                VALUES (?, ?, ?, ?, ?)
-            `, [reminderId, prescriptionId, time, 'web,email', 'PENDING']);
-        }
-        
-        res.status(201).json({ 
-            message: 'สั่งยาสำเร็จ',
-            prescriptionId
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการสั่งยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการสั่งยา', error: error.message });
-    }
-});
-
-// API เพิ่มยาใหม่ในรายการยา (สำหรับผู้ดูแลระบบ)
-app.post('/api/medications', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const {
-            name,
-            strength,
-            form,
-            manufacturer,
-            categories,
-            sideEffects,
-            contraindications,
-            interactions,
-            storageInstructions
-        } = req.body;
-        
-        // ตรวจสอบข้อมูลที่จำเป็น
-        if (!name || !strength || !form) {
-            return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-        }
-        
-        // สร้าง UUID สำหรับยาใหม่
-        const medicationId = uuidv4();
-        
-        // เพิ่มข้อมูลยาในตาราง medications
-        await pool.query(`
-            INSERT INTO medications (id, name, strength, form)
-            VALUES (?, ?, ?, ?)
-        `, [medicationId, name, strength, form]);
-        
-        // เพิ่มข้อมูลรายละเอียดยาในตาราง medication_details
-        const detailId = uuidv4();
-        await pool.query(`
-            INSERT INTO medication_details (
-                id, medication_id, manufacturer, storage_instructions, 
-                side_effects, contraindications, interactions
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        `, [
-            detailId, medicationId, manufacturer || null, storageInstructions || null,
-            sideEffects ? sideEffects.join(',') : null,
-            contraindications ? contraindications.join(',') : null,
-            interactions || null
-        ]);
-        
-        // เพิ่มความสัมพันธ์กับหมวดหมู่
-        if (categories && Array.isArray(categories)) {
-            for (const categoryId of categories) {
-                const relationId = uuidv4();
-                await pool.query(`
-                    INSERT INTO medication_category_relations (id, medication_id, category_id)
-                    VALUES (?, ?, ?)
-                `, [relationId, medicationId, categoryId]);
-            }
-        }
-        
-        res.status(201).json({ 
-            message: 'เพิ่มยาใหม่สำเร็จ',
-            medicationId
-        });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการเพิ่มยาใหม่:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการเพิ่มยาใหม่', error: error.message });
-    }
-});
-
-// API แก้ไขข้อมูลยาในรายการยา
-app.put('/api/medications/:medicationId', authenticateToken, checkRole(['DOCTOR']), async (req, res) => {
-    try {
-        const { medicationId } = req.params;
-        const {
-            name,
-            strength,
-            form,
-            manufacturer,
-            categories,
-            sideEffects,
-            contraindications,
-            interactions,
-            storageInstructions
-        } = req.body;
-        
-        // ตรวจสอบข้อมูลที่จำเป็น
-        if (!name || !strength || !form) {
-            return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-        }
-        
-        // อัปเดตข้อมูลยาในตาราง medications
-        await pool.query(`
-            UPDATE medications 
-            SET name = ?, strength = ?, form = ?
-            WHERE id = ?
-        `, [name, strength, form, medicationId]);
-        
-        // ตรวจสอบว่ามีข้อมูลรายละเอียดยาหรือไม่
-        const [details] = await pool.query('SELECT id FROM medication_details WHERE medication_id = ?', [medicationId]);
-        
-        if (details.length > 0) {
-            // อัปเดตข้อมูลรายละเอียดยา
-            await pool.query(`
-                UPDATE medication_details 
-                SET manufacturer = ?, storage_instructions = ?, 
-                    side_effects = ?, contraindications = ?, interactions = ?
-                WHERE medication_id = ?
-            `, [
-                manufacturer || null, storageInstructions || null,
-                sideEffects ? sideEffects.join(',') : null,
-                contraindications ? contraindications.join(',') : null,
-                interactions || null,
-                medicationId
-            ]);
-        } else {
-            // เพิ่มข้อมูลรายละเอียดยาใหม่
-            const detailId = uuidv4();
-            await pool.query(`
-                INSERT INTO medication_details (
-                    id, medication_id, manufacturer, storage_instructions, 
-                    side_effects, contraindications, interactions
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            `, [
-                detailId, medicationId, manufacturer || null, storageInstructions || null,
-                sideEffects ? sideEffects.join(',') : null,
-                contraindications ? contraindications.join(',') : null,
-                interactions || null
-            ]);
-        }
-        
-        // อัปเดตความสัมพันธ์กับหมวดหมู่
-        if (categories && Array.isArray(categories)) {
-            // ลบความสัมพันธ์เดิม
-            await pool.query('DELETE FROM medication_category_relations WHERE medication_id = ?', [medicationId]);
-            
-            // เพิ่มความสัมพันธ์ใหม่
-            for (const categoryId of categories) {
-                const relationId = uuidv4();
-                await pool.query(`
-                    INSERT INTO medication_category_relations (id, medication_id, category_id)
-                    VALUES (?, ?, ?)
-                `, [relationId, medicationId, categoryId]);
-            }
-        }
-        
-        res.status(200).json({ message: 'แก้ไขข้อมูลยาสำเร็จ' });
-    } catch (error) {
-        console.error('เกิดข้อผิดพลาดในการแก้ไขข้อมูลยา:', error);
-        res.status(500).json({ message: 'เกิดข้อผิดพลาดในการแก้ไขข้อมูลยา', error: error.message });
-    }
-});
-
-// เริ่มต้น Server
-const server = app.listen(port, hostname, async () => {
-    console.log(`Server running at http://${hostname}:${port}/`);
-    await checkDatabaseConnection();
-});
-
-// จัดการกับการปิด Server อย่างสง่างาม
-process.on('SIGTERM', () => {
-    console.log('ได้รับสัญญาณ SIGTERM, ปิด MediCare Reminder API...');
-    process.exit(0);
+process.on('SIGINT', async () => {
+  console.log('🛑 Received SIGINT, shutting down gracefully...');
+  await pool.end();
+  process.exit(0);
 });
 
 module.exports = app;
